@@ -1,0 +1,40 @@
+[package]
+name = "lxmf-react-native-rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "React Native bridge for LXMF-rs mesh networking"
+
+[lib]
+name = "lxmf_rn"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# LXMF-rs embedded FFI — the core mesh networking stack
+rns-embedded-ffi = { version = "0.1", features = ["std"] }
+
+# Async runtime for event polling
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+# Serialization for beacon metadata
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log = "0.4"
+
+# SQLite for message persistence
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Hex encoding for identity/destination hashes
+hex = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
