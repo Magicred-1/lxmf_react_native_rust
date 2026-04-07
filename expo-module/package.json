@@ -1,0 +1,44 @@
+{
+  "name": "@lxmf/react-native",
+  "version": "0.1.0",
+  "description": "LXMF Reticulum mesh networking for React Native + Expo",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint src",
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [
+    "lxmf",
+    "reticulum",
+    "mesh",
+    "networking",
+    "ble",
+    "react-native",
+    "expo"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anon0mesh/lxmf_react_native_rust.git"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*",
+    "expo": "*"
+  },
+  "devDependencies": {
+    "@types/react-native": "^0.72.0",
+    "typescript": "^5.0.0",
+    "expo-modules-core": "^1.11.0"
+  },
+  "files": [
+    "src",
+    "ios",
+    "android",
+    "expo-module.config.js",
+    "build"
+  ]
+}

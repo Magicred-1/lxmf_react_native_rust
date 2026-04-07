@@ -11,7 +11,11 @@ crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 # LXMF-rs embedded FFI — the core mesh networking stack
-rns-embedded-ffi = { version = "0.1", features = ["std"] }
+# Using git dependency from FreeTAKTeam/LXMF-rs
+rns-embedded-ffi = { git = "https://github.com/FreeTAKTeam/LXMF-rs.git" }
+
+# Core types from LXMF-rs (needed for event handling)
+rns-embedded-core = { git = "https://github.com/FreeTAKTeam/LXMF-rs.git" }
 
 # Async runtime for event polling
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }

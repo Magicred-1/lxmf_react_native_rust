@@ -12,6 +12,7 @@ use rns_embedded_ffi::{
     RnsEmbeddedV1NodeEvent, RnsEmbeddedV1PollResult, RnsEmbeddedV1PollResultKind,
     RnsEmbeddedV1EventKind, RnsEmbeddedV1LogLevel, RnsEmbeddedEventSubscription,
     RnsEmbeddedStatus, RnsEmbeddedNodeMode, RnsEmbeddedLifecycleState,
+    RnsEmbeddedV1NodeErrorCode,
     rns_embedded_v1_node_new, rns_embedded_v1_node_free,
     rns_embedded_v1_node_start, rns_embedded_v1_node_stop, rns_embedded_v1_node_restart,
     rns_embedded_v1_node_get_status, rns_embedded_v1_node_send, rns_embedded_v1_node_broadcast,
@@ -161,7 +162,12 @@ impl LxmfNode {
         let mut config = unsafe { rns_embedded_v1_node_config_default() };
         config.store_identity = *identity;
         config.lxmf_address = *lxmf_address;
-        config.node_mode = mode;
+        // Convert u32 mode to RnsEmbeddedNodeMode enum
+        config.node_mode = match mode {
+            1 => RnsEmbeddedNodeMode::TcpClient,
+            2 => RnsEmbeddedNodeMode::TcpServer,
+            _ => RnsEmbeddedNodeMode::BleOnly,
+        };
         config.announce_interval_ms = announce_interval_ms;
         config.ble_mtu_hint = ble_mtu_hint;
 
@@ -555,7 +561,7 @@ fn default_node_error() -> RnsEmbeddedV1NodeError {
     RnsEmbeddedV1NodeError {
         struct_size: std::mem::size_of::<RnsEmbeddedV1NodeError>(),
         struct_version: 1,
-        code: rns_embedded_ffi::RnsEmbeddedV1NodeErrorCode::None,
+        code: RnsEmbeddedV1NodeErrorCode::Unknown,
         reserved: [0u8; 16],
     }
 }
@@ -617,7 +623,7 @@ fn default_node_event() -> RnsEmbeddedV1NodeEvent {
         run_state: rns_embedded_ffi::RnsEmbeddedV1RunState::Stopped,
         lifecycle_state: RnsEmbeddedLifecycleState::Boot,
         log_level: RnsEmbeddedV1LogLevel::Info,
-        error_code: rns_embedded_ffi::RnsEmbeddedV1NodeErrorCode::None,
+        error_code: RnsEmbeddedV1NodeErrorCode::Unknown,
         frame_kind: 0,
         sequence: 0,
         bytes: 0,
