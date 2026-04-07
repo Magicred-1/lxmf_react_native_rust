@@ -14,6 +14,7 @@ pub mod beacon;
 pub mod ffi;
 pub mod framing;
 pub mod store;
+pub mod reticulum_bridge;
 
 #[cfg(target_os = "android")]
 pub mod jni_bridge;

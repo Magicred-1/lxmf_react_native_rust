@@ -86,6 +86,13 @@ pub type EventQueue = Arc<Mutex<VecDeque<LxmfEvent>>>;
 /// Global singleton node instance
 static NODE: OnceLock<Mutex<Option<LxmfNode>>> = OnceLock::new();
 
+/// Global bridge instance (for mode 3 = standard Reticulum TCP)
+static BRIDGE: OnceLock<Mutex<Option<Arc<crate::reticulum_bridge::ReticulumTcpBridge>>>> = OnceLock::new();
+
+fn bridge_global() -> &'static Mutex<Option<Arc<crate::reticulum_bridge::ReticulumTcpBridge>>> {
+    BRIDGE.get_or_init(|| Mutex::new(None))
+}
+
 /// The main LXMF mesh node
 pub struct LxmfNode {
     /// Opaque pointer to the rns-embedded-ffi V1 node
@@ -142,7 +149,8 @@ impl LxmfNode {
         Ok(())
     }
 
-    /// Start the node with the given configuration
+    /// Start the node with the given configuration.
+    /// mode: 0=BLE, 1=FFI TcpClient, 2=FFI TcpServer, 3=Standard Reticulum TCP (HDLC bridge)
     pub fn start(
         identity: &IdentityKey,
         lxmf_address: &LxmfAddress,
@@ -152,6 +160,33 @@ impl LxmfNode {
         tcp_host: Option<&str>,
         tcp_port: u16,
     ) -> Result<(), String> {
+        // Mode 3: use the Reticulum HDLC bridge instead of the V1 managed API
+        if mode == 3 {
+            let host = tcp_host.ok_or("Reticulum TCP mode requires a tcpHost")?;
+            let bridge = crate::reticulum_bridge::ReticulumTcpBridge::start(
+                crate::reticulum_bridge::BridgeConfig {
+                    identity: *identity,
+                    lxmf_address: *lxmf_address,
+                    tcp_host: host.to_string(),
+                    tcp_port,
+                    announce_interval_ms,
+                    ble_mtu_hint,
+                },
+            )?;
+
+            let mut bridge_guard = bridge_global().lock().map_err(|e| e.to_string())?;
+            *bridge_guard = Some(bridge);
+
+            // Also mark the V1 node as running for status queries
+            let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
+            if let Some(node) = guard.as_mut() {
+                node.identity = *identity;
+                node.lxmf_address = *lxmf_address;
+                node.running = true;
+            }
+            return Ok(());
+        }
+
         let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
         let node = guard.as_mut().ok_or("Node not initialized")?;
 
@@ -162,7 +197,6 @@ impl LxmfNode {
         let mut config = unsafe { rns_embedded_v1_node_config_default() };
         config.store_identity = *identity;
         config.lxmf_address = *lxmf_address;
-        // Convert u32 mode to RnsEmbeddedNodeMode enum
         config.node_mode = match mode {
             1 => RnsEmbeddedNodeMode::TcpClient,
             2 => RnsEmbeddedNodeMode::TcpServer,

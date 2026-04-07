@@ -1,7 +1,4 @@
-import { NativeModule, requireNativeModule } from 'expo-modules-core';
-
-// Import the native module
-const LxmfModuleNative = requireNativeModule('LxmfModule') as NativeModuleType;
+import { NativeModule, requireOptionalNativeModule } from 'expo-modules-core';
 
 export interface NativeModuleType extends NativeModule {
   // Lifecycle
@@ -36,4 +33,31 @@ export interface NativeModuleType extends NativeModule {
   stopBLE(): void;
 }
 
-export const LxmfModule = LxmfModuleNative;
+const MISSING_NATIVE_MESSAGE =
+  "Cannot find native module 'LxmfModule'. Use an Expo development build (not Expo Go) and rebuild native apps after local module changes.";
+
+const LxmfModuleNative = requireOptionalNativeModule<NativeModuleType>('LxmfModule');
+
+export const isLxmfNativeAvailable = !!LxmfModuleNative;
+
+const throwMissingNative = (): never => {
+  throw new Error(MISSING_NATIVE_MESSAGE);
+};
+
+const missingNativeShim: NativeModuleType = {
+  init: () => throwMissingNative(),
+  start: async () => throwMissingNative(),
+  stop: async () => throwMissingNative(),
+  isRunning: () => false,
+  send: async () => throwMissingNative(),
+  broadcast: async () => throwMissingNative(),
+  getStatus: () => throwMissingNative(),
+  getBeacons: () => throwMissingNative(),
+  fetchMessages: () => throwMissingNative(),
+  setLogLevel: () => throwMissingNative(),
+  abiVersion: () => throwMissingNative(),
+  startBLE: () => throwMissingNative(),
+  stopBLE: () => throwMissingNative(),
+} as NativeModuleType;
+
+export const LxmfModule = LxmfModuleNative ?? missingNativeShim;

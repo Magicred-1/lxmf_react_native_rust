@@ -1,0 +1,10 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["LxmfModule"],
+    "podspecPath": "LxmfReactNative.podspec"
+  },
+  "android": {
+    "modules": ["expo.modules.lxmf.LxmfModule"]
+  }
+}

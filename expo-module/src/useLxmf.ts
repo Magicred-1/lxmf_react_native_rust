@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { NativeEventEmitter } from 'react-native';
-import { LxmfModule } from './LxmfModule';
-
-const eventEmitter = new NativeEventEmitter(LxmfModule as any);
+import { isLxmfNativeAvailable, LxmfModule } from './LxmfModule';
 
 export interface LxmfNodeStatus {
   running: boolean;
@@ -27,12 +25,34 @@ export interface LxmfEvent {
   [key: string]: any;
 }
 
+/** Node transport mode */
+export enum LxmfNodeMode {
+  /** BLE-only mesh (default) */
+  BleOnly = 0,
+  /** Connect via FFI's internal TCP (non-standard framing) */
+  TcpClient = 1,
+  /** Listen via FFI's internal TCP (non-standard framing) */
+  TcpServer = 2,
+  /** Connect to standard Reticulum daemon (rnsd) via HDLC-framed TCP */
+  Reticulum = 3,
+}
+
 export interface UseLxmfOptions {
   autoStart?: boolean;
   identityHex?: string;
   lxmfAddressHex?: string;
   dbPath?: string;
   logLevel?: number;
+  /** Transport mode — BLE, TCP client, or TCP server. Default: BleOnly */
+  mode?: LxmfNodeMode;
+  /** TCP host to connect to (client) or bind on (server). Required when mode is TCP. */
+  tcpHost?: string;
+  /** TCP port. Required when mode is TCP. */
+  tcpPort?: number;
+  /** Announce interval in ms. Default: 5000 */
+  announceIntervalMs?: number;
+  /** BLE MTU hint. Default: 255 */
+  bleMtuHint?: number;
 }
 
 export function useLxmf(options: UseLxmfOptions = {}) {
@@ -44,6 +64,13 @@ export function useLxmf(options: UseLxmfOptions = {}) {
 
   // Initialize the module
   useEffect(() => {
+    if (!isLxmfNativeAvailable) {
+      setError(
+        "Cannot find native module 'LxmfModule'. Run this app in an Expo development build (not Expo Go)."
+      );
+      return;
+    }
+
     const init = () => {
       try {
         const dbPath = options.dbPath || null;
@@ -61,6 +88,12 @@ export function useLxmf(options: UseLxmfOptions = {}) {
 
   // Event listeners
   useEffect(() => {
+    if (!isLxmfNativeAvailable) {
+      return;
+    }
+
+    const eventEmitter = new NativeEventEmitter(LxmfModule as any);
+
     const subscriptions = [
       eventEmitter.addListener('onStatusChanged', (event) => {
         setStatus(event);
@@ -108,27 +141,55 @@ export function useLxmf(options: UseLxmfOptions = {}) {
 
   // Start/stop the node
   const start = useCallback(
-    async (identityHex: string, lxmfAddressHex: string, mode: number = 0) => {
+    async (overrides?: {
+      identityHex?: string;
+      lxmfAddressHex?: string;
+      mode?: LxmfNodeMode;
+      tcpHost?: string;
+      tcpPort?: number;
+    }) => {
       try {
-        const success = await LxmfModule.start(
-          identityHex,
-          lxmfAddressHex,
-          mode,
-          options.logLevel ? 2000 : 5000, // announce interval
-          255, // BLE MTU
-          null, // TCP host
-          0 // TCP port
-        );
-        if (!success) {
-          setError('Failed to start LXMF node');
+        if (!isLxmfNativeAvailable) {
+          setError(
+            "Cannot find native module 'LxmfModule'. Run this app in an Expo development build (not Expo Go)."
+          );
+          return false;
         }
-        return success;
+
+        const resolvedIdentityHex = overrides?.identityHex ?? options.identityHex;
+        const resolvedLxmfAddressHex = overrides?.lxmfAddressHex ?? options.lxmfAddressHex;
+        if (!resolvedIdentityHex || !resolvedLxmfAddressHex) {
+          setError('Missing identity or LXMF address. Pass them to start() or UseLxmfOptions.');
+          return false;
+        }
+
+        const mode = overrides?.mode ?? options.mode ?? LxmfNodeMode.BleOnly;
+        const tcpHost = overrides?.tcpHost ?? options.tcpHost ?? null;
+        const tcpPort = overrides?.tcpPort ?? options.tcpPort ?? 0;
+        const announceMs = options.announceIntervalMs ?? 5000;
+        const bleMtu = options.bleMtuHint ?? 255;
+
+        if (mode !== LxmfNodeMode.BleOnly && !tcpHost) {
+          setError(`Mode ${mode} requires a tcpHost.`);
+          return false;
+        }
+
+        await LxmfModule.start(
+          resolvedIdentityHex,
+          resolvedLxmfAddressHex,
+          mode,
+          announceMs,
+          bleMtu,
+          tcpHost,
+          tcpPort,
+        );
+        return true;
       } catch (e: any) {
         setError(e.message);
         return false;
       }
     },
-    [options.logLevel]
+    [options.identityHex, options.lxmfAddressHex, options.mode, options.tcpHost, options.tcpPort, options.announceIntervalMs, options.bleMtuHint]
   );
 
   const stop = useCallback(async () => {
@@ -203,6 +264,7 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     events,
     error,
     isRunning: LxmfModule.isRunning(),
+    isNativeAvailable: isLxmfNativeAvailable,
 
     // Methods
     start,

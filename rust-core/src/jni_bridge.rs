@@ -4,13 +4,20 @@
 //! Type conversions: JString <-> Rust String, jbyteArray <-> Vec<u8>.
 
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jint, jlong, jboolean, jshort};
+use jni::objects::{JByteArray, JClass, JString, JObject};
+use jni::sys::{jint, jlong, jboolean, jshort, jstring};
+use log::error;
 
 use crate::node::{LxmfNode, DestHash, IdentityKey, LxmfAddress};
 
 const JNI_TRUE: jboolean = 1;
 const JNI_FALSE: jboolean = 0;
+
+/// Log an error and throw a Java RuntimeException so JS gets the real message.
+fn throw_err(env: &mut JNIEnv, msg: &str) {
+    error!("LxmfModule JNI: {}", msg);
+    let _ = env.throw_new("java/lang/RuntimeException", msg);
+}
 
 // --- Lifecycle ---
 
@@ -20,6 +27,16 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeInit(
     _class: JClass,
     db_path: JString,
 ) -> jint {
+    // Initialize android logger on first call
+    #[cfg(target_os = "android")]
+    {
+        let _ = android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Debug)
+                .with_tag("LxmfRust"),
+        );
+    }
+
     let path: Option<String> = if db_path.is_null() {
         None
     } else {
@@ -28,7 +45,10 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeInit(
 
     match LxmfNode::init(path.as_deref()) {
         Ok(()) => 0,
-        Err(_) => -1,
+        Err(e) => {
+            throw_err(&mut env, &format!("init failed: {}", e));
+            -1
+        }
     }
 }
 
@@ -36,26 +56,51 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeInit(
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeStart(
     mut env: JNIEnv,
     _class: JClass,
-    identity: JByteArray,
-    lxmf_address: JByteArray,
+    identity_hex: JString,
+    lxmf_address_hex: JString,
     mode: jint,
     announce_interval_ms: jlong,
     ble_mtu_hint: jshort,
     tcp_host: JString,
     tcp_port: jshort,
 ) -> jint {
-    let identity_bytes = match env.convert_byte_array(&identity) {
-        Ok(b) => b,
-        Err(_) => return -1,
+    let id_str: String = match env.get_string(&identity_hex) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            throw_err(&mut env, &format!("bad identity string: {}", e));
+            return -1;
+        }
     };
-    let address_bytes = match env.convert_byte_array(&lxmf_address) {
-        Ok(b) => b,
-        Err(_) => return -1,
+    let addr_str: String = match env.get_string(&lxmf_address_hex) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            throw_err(&mut env, &format!("bad address string: {}", e));
+            return -1;
+        }
     };
 
-    if identity_bytes.len() != 32 || address_bytes.len() != 16 {
-        return -1;
-    }
+    let identity_bytes = match hex::decode(&id_str) {
+        Ok(b) if b.len() == 32 => b,
+        Ok(b) => {
+            throw_err(&mut env, &format!("identity hex wrong length: {} bytes (need 32)", b.len()));
+            return -1;
+        }
+        Err(e) => {
+            throw_err(&mut env, &format!("identity hex decode failed: {}", e));
+            return -1;
+        }
+    };
+    let address_bytes = match hex::decode(&addr_str) {
+        Ok(b) if b.len() == 16 => b,
+        Ok(b) => {
+            throw_err(&mut env, &format!("address hex wrong length: {} bytes (need 16)", b.len()));
+            return -1;
+        }
+        Err(e) => {
+            throw_err(&mut env, &format!("address hex decode failed: {}", e));
+            return -1;
+        }
+    };
 
     let mut id_arr: IdentityKey = [0u8; 32];
     id_arr.copy_from_slice(&identity_bytes);
@@ -68,6 +113,8 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeStart(
         env.get_string(&tcp_host).ok().map(|s| s.into())
     };
 
+    error!("LxmfModule: starting node mode={} host={:?} port={}", mode, host, tcp_port);
+
     match LxmfNode::start(
         &id_arr,
         &addr_arr,
@@ -77,8 +124,14 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeStart(
         host.as_deref(),
         tcp_port as u16,
     ) {
-        Ok(()) => 0,
-        Err(_) => -1,
+        Ok(()) => {
+            error!("LxmfModule: node started successfully");
+            0
+        }
+        Err(e) => {
+            throw_err(&mut env, &format!("start failed: {}", e));
+            -1
+        }
     }
 }
 
@@ -107,17 +160,23 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeIsRunning(
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeSend(
     mut env: JNIEnv,
     _class: JClass,
-    dest: JByteArray,
-    body: JByteArray,
+    dest_hex: JString,
+    body_base64: JString,
 ) -> jlong {
-    let dest_bytes = match env.convert_byte_array(&dest) {
+    let dest_str: String = match env.get_string(&dest_hex) {
+        Ok(s) => s.into(),
+        Err(_) => return -1,
+    };
+    let body_str: String = match env.get_string(&body_base64) {
+        Ok(s) => s.into(),
+        Err(_) => return -1,
+    };
+
+    let dest_bytes = match hex::decode(&dest_str) {
         Ok(b) if b.len() == 16 => b,
         _ => return -1,
     };
-    let body_bytes = match env.convert_byte_array(&body) {
-        Ok(b) => b,
-        Err(_) => return -1,
-    };
+    let body_bytes = body_str.as_bytes().to_vec();
 
     let mut dest_arr: DestHash = [0u8; 16];
     dest_arr.copy_from_slice(&dest_bytes);
@@ -132,28 +191,36 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeSend(
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBroadcast(
     mut env: JNIEnv,
     _class: JClass,
-    dests: JByteArray,
-    dest_count: jint,
-    body: JByteArray,
+    dests_json: JString,
+    body_base64: JString,
 ) -> jlong {
-    let dests_bytes = match env.convert_byte_array(&dests) {
-        Ok(b) => b,
+    let dests_str: String = match env.get_string(&dests_json) {
+        Ok(s) => s.into(),
         Err(_) => return -1,
     };
-    let body_bytes = match env.convert_byte_array(&body) {
-        Ok(b) => b,
+    let body_str: String = match env.get_string(&body_base64) {
+        Ok(s) => s.into(),
         Err(_) => return -1,
     };
 
-    let destinations: Vec<DestHash> = dests_bytes.chunks_exact(16).map(|chunk| {
-        let mut arr = [0u8; 16];
-        arr.copy_from_slice(chunk);
-        arr
-    }).collect();
+    let hex_list: Vec<String> = match serde_json::from_str(&dests_str) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
 
-    if destinations.len() != dest_count as usize {
-        return -1;
+    let mut destinations: Vec<DestHash> = Vec::with_capacity(hex_list.len());
+    for h in &hex_list {
+        match hex::decode(h) {
+            Ok(b) if b.len() == 16 => {
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&b);
+                destinations.push(arr);
+            }
+            _ => return -1,
+        }
     }
+
+    let body_bytes = body_str.as_bytes().to_vec();
 
     match LxmfNode::broadcast(&destinations, &body_bytes) {
         Ok(receipt) => receipt.operation_id as jlong,
@@ -164,11 +231,11 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBroadcast(
 // --- Event polling ---
 
 #[no_mangle]
-pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativePollEvents(
-    mut env: JNIEnv,
-    _class: JClass,
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativePollEvents<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
     timeout_ms: jlong,
-) -> JByteArray {
+) -> JByteArray<'local> {
     let events = LxmfNode::poll_events(timeout_ms as u64);
     let json = crate::ffi::events_to_json_internal(&events);
     let bytes = json.as_bytes();
@@ -185,10 +252,10 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativePollEvents(
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetStatus(
     mut env: JNIEnv,
     _class: JClass,
-) -> JByteArray {
+) -> jstring {
     let status = match LxmfNode::get_status() {
         Ok(s) => s,
-        Err(_) => return JByteArray::default(),
+        Err(_) => return std::ptr::null_mut(),
     };
 
     let json = serde_json::json!({
@@ -202,9 +269,9 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetStatus(
         "lxmfMessagesReceived": status.lxmf_messages_received,
     }).to_string();
 
-    match env.byte_array_from_slice(json.as_bytes()) {
-        Ok(arr) => arr,
-        Err(_) => JByteArray::default(),
+    match env.new_string(&json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 
@@ -214,20 +281,20 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetStatus(
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetBeacons(
     mut env: JNIEnv,
     _class: JClass,
-) -> JByteArray {
+) -> jstring {
     let guard = match LxmfNode::global().lock() {
         Ok(g) => g,
-        Err(_) => return JByteArray::default(),
+        Err(_) => return std::ptr::null_mut(),
     };
     let node = match guard.as_ref() {
         Some(n) => n,
-        None => return JByteArray::default(),
+        None => return std::ptr::null_mut(),
     };
 
     let json = node.beacon_mgr.beacons_json();
-    match env.byte_array_from_slice(json.as_bytes()) {
-        Ok(arr) => arr,
-        Err(_) => JByteArray::default(),
+    match env.new_string(&json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 
@@ -284,14 +351,14 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeFetchMessages(
     mut env: JNIEnv,
     _class: JClass,
     limit: jint,
-) -> JByteArray {
+) -> jstring {
     let guard = match LxmfNode::global().lock() {
         Ok(g) => g,
-        Err(_) => return JByteArray::default(),
+        Err(_) => return std::ptr::null_mut(),
     };
     let node = match guard.as_ref() {
         Some(n) => n,
-        None => return JByteArray::default(),
+        None => return std::ptr::null_mut(),
     };
 
     let json = match &node.store {
@@ -299,9 +366,9 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeFetchMessages(
         None => "[]".into(),
     };
 
-    match env.byte_array_from_slice(json.as_bytes()) {
-        Ok(arr) => arr,
-        Err(_) => JByteArray::default(),
+    match env.new_string(&json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 

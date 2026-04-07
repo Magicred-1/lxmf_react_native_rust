@@ -1,0 +1,42 @@
+apply plugin: 'com.android.library'
+apply plugin: 'expo-module-gradle-plugin'
+
+android {
+    namespace "expo.modules.lxmf"
+    compileSdk 36
+
+    defaultConfig {
+        minSdk 24
+        versionCode 1
+        versionName "1.0.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+}
+
+dependencies {
+    compileOnly project(':expo-modules-core')
+}
+
+// Copy Rust library
+task copyRustLibraries(type: Copy) {
+    def rustLibDir = file("../../rust-core/target/aarch64-linux-android/release")
+    from(rustLibDir)
+    include("liblxmf_rn.so")
+    into("src/main/jniLibs/arm64-v8a")
+}
+
+tasks.named("preBuild") {
+    dependsOn copyRustLibraries
+}
