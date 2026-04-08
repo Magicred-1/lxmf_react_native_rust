@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { NativeEventEmitter } from 'react-native';
-import { isLxmfNativeAvailable, LxmfModule } from './LxmfModule';
+import { isLxmfNativeAvailable, LxmfModule, LxmfModuleNative } from './LxmfModule';
 
 export interface LxmfNodeStatus {
   running: boolean;
@@ -87,6 +86,16 @@ export function useLxmf(options: UseLxmfOptions = {}) {
         const success = LxmfModule.init(dbPath);
         if (!success) {
           setError('Failed to initialize LXMF module');
+          return;
+        }
+        // Sync running state and status on mount (node may already be running)
+        const alreadyRunning = LxmfModule.isRunning();
+        setRunning(alreadyRunning);
+        if (alreadyRunning) {
+          try {
+            const statusJson = LxmfModule.getStatus();
+            if (statusJson) setStatus(JSON.parse(statusJson) as LxmfNodeStatus);
+          } catch {}
         }
       } catch (e: any) {
         setError(e.message);
@@ -97,47 +106,59 @@ export function useLxmf(options: UseLxmfOptions = {}) {
   }, [options.dbPath]);
 
   // Event listeners
+  // In Expo SDK 50+, NativeModule IS the EventEmitter (C++ implementation).
+  // Call addListener() directly on the native module — NativeEventEmitter does NOT work.
   useEffect(() => {
-    if (!isLxmfNativeAvailable) {
+    if (!isLxmfNativeAvailable || !LxmfModuleNative) {
       return;
     }
 
-    const eventEmitter = new NativeEventEmitter(LxmfModule as any);
+    // Cast to any: NativeModule<Record<never,never>> makes addListener's event names `never`,
+    // but at runtime the Expo C++ EventEmitter implements addListener for all declared events.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mod = LxmfModuleNative as any;
 
     const subscriptions = [
-      eventEmitter.addListener('onStatusChanged', (event) => {
-        const normalized = pushEvent('statusChanged', event);
-        setStatus(normalized as unknown as LxmfNodeStatus);
+      mod.addListener('onStatusChanged', (event: Record<string, any>) => {
+        pushEvent('statusChanged', event);
+        if (typeof event.running === 'boolean') {
+          setRunning(event.running);
+        }
+        // Fetch complete status (event only has running+lifecycle, not identity/mode)
+        try {
+          const statusJson = LxmfModule.getStatus();
+          if (statusJson) setStatus(JSON.parse(statusJson) as LxmfNodeStatus);
+        } catch {}
       }),
-      eventEmitter.addListener('onPacketReceived', (event) => {
+      mod.addListener('onPacketReceived', (event: Record<string, any>) => {
         pushEvent('packetReceived', event);
       }),
-      eventEmitter.addListener('onTxReceived', (event) => {
+      mod.addListener('onTxReceived', (event: Record<string, any>) => {
         pushEvent('txReceived', event);
       }),
-      eventEmitter.addListener('onBeaconDiscovered', (event) => {
+      mod.addListener('onBeaconDiscovered', (event: Record<string, any>) => {
         pushEvent('beaconDiscovered', event);
       }),
-      eventEmitter.addListener('onMessageReceived', (event) => {
+      mod.addListener('onMessageReceived', (event: Record<string, any>) => {
         pushEvent('messageReceived', event);
       }),
-      eventEmitter.addListener('onAnnounceReceived', (event) => {
+      mod.addListener('onAnnounceReceived', (event: Record<string, any>) => {
         pushEvent('announceReceived', event);
       }),
-      eventEmitter.addListener('onLog', (event) => {
+      mod.addListener('onLog', (event: Record<string, any>) => {
         pushEvent('log', event);
-        if (options.logLevel && options.logLevel >= event.level) {
-          console.log(`[LXMF] ${event.message}`);
+        if (options.logLevel && options.logLevel >= (event.level as number)) {
+          console.log(`[LXMF] ${String(event.message)}`);
         }
       }),
-      eventEmitter.addListener('onError', (event) => {
+      mod.addListener('onError', (event: Record<string, any>) => {
         pushEvent('error', event);
-        setError(`${event.code}: ${event.message}`);
+        setError(`${String(event.code)}: ${String(event.message)}`);
       }),
     ];
 
     return () => {
-      subscriptions.forEach(sub => sub.remove());
+      subscriptions.forEach((sub: { remove: () => void }) => sub.remove());
     };
   }, [options.logLevel, pushEvent]);
 
@@ -212,6 +233,7 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     try {
       await LxmfModule.stop();
       setRunning(false);
+      setStatus(null);
     } catch (e: any) {
       setError(e.message);
     }
@@ -238,7 +260,9 @@ export function useLxmf(options: UseLxmfOptions = {}) {
   const getStatus = useCallback(() => {
     try {
       const statusJson = LxmfModule.getStatus();
-      return statusJson ? JSON.parse(statusJson) : null;
+      const parsed = statusJson ? (JSON.parse(statusJson) as LxmfNodeStatus) : null;
+      if (parsed) setStatus(parsed);
+      return parsed;
     } catch (e: any) {
       setError(`Failed to parse status payload: ${e?.message ?? 'unknown error'}`);
       return null;

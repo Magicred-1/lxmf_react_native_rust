@@ -43,21 +43,138 @@ function utf8ToBase64(input: string): string {
   return input;
 }
 
-function decodeHexToUtf8(hexValue: string): string {
-  if (!hexValue || hexValue.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hexValue)) {
-    return hexValue || '—';
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = Number.parseInt(hex.slice(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+function bytesToUtf8(bytes: Uint8Array): string {
+  if (typeof TextDecoder !== 'undefined') {
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  }
+  return String.fromCharCode(...Array.from(bytes));
+}
+
+
+/**
+ * Minimal msgpack decoder for the LXMF message format:
+ *   [timestamp: float, title: str|bin, content: str|bin, fields: map|nil]
+ */
+function decodeLxmfMsgpack(bytes: Uint8Array): { timestamp: number; title: string; content: string } | null {
+  let pos = 0;
+
+  const readByte = (): number => {
+    if (pos >= bytes.length) throw new Error('eof');
+    return bytes[pos++]!;
+  };
+  const readSlice = (n: number): Uint8Array => {
+    const s = bytes.slice(pos, pos + n);
+    pos += n;
+    return s;
+  };
+  const readU16 = (): number => { const b = readSlice(2); return (b[0]! << 8) | b[1]!; };
+  const readU32 = (): number => { const b = readSlice(4); return ((b[0]! << 24) | (b[1]! << 16) | (b[2]! << 8) | b[3]!) >>> 0; };
+  const readF64 = (): number => {
+    const b = readSlice(8);
+    const v = new DataView(b.buffer, b.byteOffset, 8);
+    return v.getFloat64(0, false);
+  };
+  const readF32 = (): number => {
+    const b = readSlice(4);
+    const v = new DataView(b.buffer, b.byteOffset, 4);
+    return v.getFloat32(0, false);
+  };
+
+  function readValue(): unknown {
+    const t = readByte();
+    if (t <= 0x7f) return t;                             // positive fixint
+    if (t >= 0xe0) return t - 256;                       // negative fixint
+    if (t >= 0xa0 && t <= 0xbf) return bytesToUtf8(readSlice(t & 0x1f)); // fixstr
+    if (t >= 0x90 && t <= 0x9f) { const n = t & 0x0f; return Array.from({ length: n }, () => readValue()); } // fixarray
+    if (t >= 0x80 && t <= 0x8f) { // fixmap
+      const n = t & 0x0f;
+      const m: Record<string, unknown> = {};
+      for (let i = 0; i < n; i++) { const k = readValue(); m[String(k)] = readValue(); }
+      return m;
+    }
+    switch (t) {
+      case 0xc0: return null;
+      case 0xc2: return false;
+      case 0xc3: return true;
+      case 0xc4: return bytesToUtf8(readSlice(readByte()));      // bin8 → string
+      case 0xc5: return bytesToUtf8(readSlice(readU16()));       // bin16
+      case 0xc6: return bytesToUtf8(readSlice(readU32()));       // bin32
+      case 0xca: return readF32();
+      case 0xcb: return readF64();
+      case 0xcc: return readByte();                              // uint8
+      case 0xcd: return readU16();                              // uint16
+      case 0xce: return readU32();                              // uint32
+      case 0xd0: { const b = readByte(); return b > 127 ? b - 256 : b; } // int8
+      case 0xd1: { const v = readU16(); return v > 0x7fff ? v - 0x10000 : v; }
+      case 0xd2: { const v = readU32(); return v > 0x7fffffff ? v - 0x100000000 : v; }
+      case 0xd9: return bytesToUtf8(readSlice(readByte()));      // str8
+      case 0xda: return bytesToUtf8(readSlice(readU16()));       // str16
+      case 0xdb: return bytesToUtf8(readSlice(readU32()));       // str32
+      case 0xdc: { const n = readU16(); return Array.from({ length: n }, () => readValue()); } // array16
+      case 0xdd: { const n = readU32(); return Array.from({ length: n }, () => readValue()); } // array32
+      default: return null;
+    }
+  }
+
+  try {
+    const val = readValue();
+    if (!Array.isArray(val) || val.length < 3) return null;
+    return {
+      timestamp: typeof val[0] === 'number' ? val[0] : 0,
+      title: typeof val[1] === 'string' ? val[1] : '',
+      content: typeof val[2] === 'string' ? val[2] : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * LXMF wire format: [16B dest hash][16B source hash][64B Ed25519 sig][msgpack payload]
+ * msgpack payload: [timestamp: f64, title: bytes, content: bytes, fields: map, stamp?: bytes]
+ */
+const LXMF_HEADER_BYTES = 96; // 16 + 16 + 64
+
+/** Extract the sender's LXMF address (bytes 16-31) from a raw LXMF message. */
+function lxmfSourceHex(bytes: Uint8Array): string | null {
+  if (bytes.length < LXMF_HEADER_BYTES) return null;
+  return Array.from(bytes.slice(16, 32))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/** Decode a hex-encoded LXMF message payload into readable text. */
+function decodeLxmfContent(hexContent: string): string {
+  if (!hexContent || hexContent.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hexContent)) {
+    return '—';
   }
   try {
-    const bytes = new Uint8Array(hexValue.length / 2);
-    for (let i = 0; i < hexValue.length; i += 2) {
-      bytes[i / 2] = Number.parseInt(hexValue.slice(i, i + 2), 16);
+    const bytes = hexToBytes(hexContent);
+
+    // Try LXMF wire format: skip 96-byte header, parse msgpack payload
+    if (bytes.length > LXMF_HEADER_BYTES) {
+      const payload = bytes.slice(LXMF_HEADER_BYTES);
+      const lxmf = decodeLxmfMsgpack(payload);
+      if (lxmf) {
+        const parts: string[] = [];
+        if (lxmf.title.trim()) parts.push(`[${lxmf.title.trim()}]`);
+        if (lxmf.content.trim()) parts.push(lxmf.content.trim());
+        return parts.length > 0 ? parts.join(' ') : '(empty)';
+      }
     }
-    if (typeof TextDecoder !== 'undefined') {
-      return new TextDecoder().decode(bytes);
-    }
-    return hexValue;
+
+    // Fall back: messages sent by our own app are raw UTF-8 (no LXMF header)
+    return bytesToUtf8(bytes).trim() || '(empty)';
   } catch {
-    return hexValue;
+    return '(decode error)';
   }
 }
 
@@ -112,9 +229,6 @@ function getNextMode(mode: LxmfNodeMode): LxmfNodeMode {
   return LxmfNodeMode.Reticulum;
 }
 
-function getAnnounceKey(a: LxmfEvent): string {
-  return `${String(a.destHash ?? 'unknown')}:${String(a.hops ?? '?')}:${String(a.appData ?? '')}`;
-}
 
 function getMessageKey(m: LxmfEvent): string {
   return `${String(m.source ?? 'unknown')}:${String(m.timestamp ?? '')}:${String(m.content ?? '')}`;
@@ -298,6 +412,7 @@ export default function RootLayout() { // NOSONAR
     isNativeAvailable,
     error,
     events,
+    status: nodeStatus,
     start,
     stop,
     send,
@@ -313,7 +428,6 @@ export default function RootLayout() { // NOSONAR
     announceIntervalMs: Number.parseInt(announceMs, 10) || 30000,
   });
 
-  const [nodeStatus, setNodeStatus] = useState<LxmfNodeStatus | null>(null);
   const [announces, setAnnounces] = useState<LxmfEvent[]>([]);
   const [messages, setMessages] = useState<LxmfEvent[]>([]);
   const [holdAnnounces, setHoldAnnounces] = useState<HoldAnnounceEntry[]>([]);
@@ -341,22 +455,31 @@ export default function RootLayout() { // NOSONAR
 
   const handleStart = useCallback(async () => {
     await start();
-    setTimeout(() => {
-      setNodeStatus(getStatus());
-    }, 3000);
-  }, [start, getStatus]);
+    // Status updates automatically via onStatusChanged event → hook's status state
+  }, [start]);
 
   const handleStop = useCallback(async () => {
     await stop();
-    setNodeStatus(null);
+    // Hook's stop() clears status state
   }, [stop]);
 
   const handleRefresh = useCallback(() => {
     setRefreshing(true);
-    setNodeStatus(getStatus());
+    getStatus(); // updates hook's status state as side effect
     fetchMessages(20);
     setRefreshing(false);
   }, [getStatus, fetchMessages]);
+
+  // Deduplicated peers: one entry per destHash, most recent announce wins
+  const peers = useMemo(() => {
+    const seen = new Set<string>();
+    return announces.filter((a) => {
+      const dest = String(a.destHash || '').toLowerCase();
+      if (!dest || seen.has(dest)) return false;
+      seen.add(dest);
+      return true;
+    });
+  }, [announces]);
 
   const knownDestinations = useMemo(
     () => new Set(announces.map((event) => String(event.destHash || '').toLowerCase())),
@@ -392,7 +515,7 @@ export default function RootLayout() { // NOSONAR
   useEffect(() => {
     if (!isRunning) return;
     const interval = setInterval(() => {
-      setNodeStatus(getStatus());
+      getStatus(); // updates hook's status state as side effect
     }, 5000);
     return () => clearInterval(interval);
   }, [isRunning, getStatus]);
@@ -516,35 +639,47 @@ export default function RootLayout() { // NOSONAR
         </View>
 
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Network Announces ({announces.length})</Text>
-          {announces.length > 0 ? (
-            announces.slice(0, 20).map((announce) => {
-              const destination = String(announce.destHash || '').toLowerCase();
+          <Text style={styles.cardTitle}>Peers ({peers.length})</Text>
+          {peers.length > 0 ? (
+            peers.slice(0, 40).map((peer) => {
+              const destination = String(peer.destHash || '').toLowerCase();
+              const name = peer.appData ? String(peer.appData).trim() : null;
+              const hops = peer.hops ?? '?';
               const sendReady = destination.length === 32 && !resolvingDestinations.has(destination);
 
               return (
                 <TouchableOpacity
-                  key={getAnnounceKey(announce)}
-                  style={styles.listItem}
+                  key={destination}
+                  style={styles.peerRow}
                   onPress={() => setSendDest(destination)}
                   activeOpacity={0.75}
                 >
-                  <View style={styles.announceHeaderRow}>
-                    <Text style={styles.mono}>{truncHex(destination, 12)}</Text>
-                    <Text style={sendReady ? styles.sendReadyBadge : styles.sendResolvingBadge}>
-                      {sendReady ? 'SEND READY' : 'RESOLVING'}
+                  <View style={styles.peerAvatar}>
+                    <Text style={styles.peerAvatarText}>
+                      {name ? name.slice(0, 1).toUpperCase() : '#'}
                     </Text>
                   </View>
-                  <Text style={styles.muted}>
-                    {announce.appData ? String(announce.appData) : '—'} | {announce.hops ?? '?'} hops
-                  </Text>
+                  <View style={styles.peerInfo}>
+                    <View style={styles.peerNameRow}>
+                      <Text style={styles.peerName} numberOfLines={1}>
+                        {name || truncHex(destination, 10)}
+                      </Text>
+                      <Text style={styles.peerHops}>{hops} hop{hops !== 1 ? 's' : ''}</Text>
+                    </View>
+                    <View style={styles.peerAddressRow}>
+                      <Text style={styles.peerAddress}>{truncHex(destination, 10)}</Text>
+                      <Text style={sendReady ? styles.sendReadyBadge : styles.sendResolvingBadge}>
+                        {sendReady ? 'SEND READY' : 'RESOLVING'}
+                      </Text>
+                    </View>
+                  </View>
                 </TouchableOpacity>
               );
             })
           ) : (
             <Text style={styles.muted}>
               {isRunning
-                ? 'Listening for announces from the network...'
+                ? 'Listening for peers on the network...'
                 : 'Start the node to discover peers'}
             </Text>
           )}
@@ -553,14 +688,22 @@ export default function RootLayout() { // NOSONAR
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Messages ({messages.length})</Text>
           {messages.length > 0 ? (
-            messages.slice(0, 30).map((message) => (
-              <View key={getMessageKey(message)} style={styles.listItem}>
-                <Text style={styles.mono}>{truncHex(String(message.source || '???'))}</Text>
-                <Text style={styles.muted} numberOfLines={2}>
-                  {message.content ? decodeHexToUtf8(String(message.content)) : JSON.stringify(message)}
-                </Text>
-              </View>
-            ))
+            messages.slice(0, 30).map((message, idx) => {
+              const rawContent = String(message.content || '');
+              const contentBytes = rawContent.length > 0 && rawContent.length % 2 === 0
+                ? hexToBytes(rawContent) : null;
+              // Real sender is in wire header bytes 16-31; fallback to event source field
+              const realSource = contentBytes ? lxmfSourceHex(contentBytes) : null;
+              const displaySource = realSource ?? String(message.source || '???');
+              return (
+                <View key={`${getMessageKey(message)}_${idx}`} style={styles.listItem}>
+                  <Text style={styles.mono}>{truncHex(displaySource, 12)}</Text>
+                  <Text style={styles.messageText} numberOfLines={4}>
+                    {decodeLxmfContent(rawContent)}
+                  </Text>
+                </View>
+              );
+            })
           ) : (
             <Text style={styles.muted}>No messages yet</Text>
           )}
@@ -765,6 +908,69 @@ const styles = StyleSheet.create({
     color: '#d29922',
     fontSize: 11,
     fontWeight: '700',
+  },
+  messageText: {
+    color: '#e6edf3',
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 2,
+  },
+  peerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#21262d',
+    gap: 12,
+  },
+  peerAvatar: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: '#1f6feb33',
+    borderWidth: 1,
+    borderColor: '#1f6feb66',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  peerAvatarText: {
+    color: '#58a6ff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  peerInfo: {
+    flex: 1,
+    gap: 2,
+  },
+  peerNameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  peerName: {
+    color: '#e6edf3',
+    fontSize: 14,
+    fontWeight: '600',
+    flex: 1,
+  },
+  peerHops: {
+    color: '#7d8590',
+    fontSize: 12,
+    flexShrink: 0,
+  },
+  peerAddressRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  peerAddress: {
+    color: '#79c0ff',
+    fontSize: 11,
+    fontFamily: 'monospace',
+    flex: 1,
   },
   logLine: {
     color: '#7d8590',

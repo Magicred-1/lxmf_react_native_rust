@@ -61,3 +61,10 @@ const missingNativeShim: NativeModuleType = {
 } as NativeModuleType;
 
 export const LxmfModule = LxmfModuleNative ?? missingNativeShim;
+
+/**
+ * The raw native module instance, or null when unavailable.
+ * In Expo SDK 50+, NativeModule extends the C++ EventEmitter — call addListener() on it directly.
+ * Do NOT use NativeEventEmitter from react-native; it does not wire up to Expo module events.
+ */
+export { LxmfModuleNative };
