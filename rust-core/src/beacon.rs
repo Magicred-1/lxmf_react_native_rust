@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::node::{DestHash, LxmfEvent, ANNOUNCE_DATA};
+use crate::node::{DestHash, LxmfEvent};
+
+pub const ANNOUNCE_DATA: &[u8] = b"anonmesh::beacon::v1";
 
 /// Beacon connection state
 #[derive(Debug, Clone, PartialEq)]

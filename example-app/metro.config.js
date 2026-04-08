@@ -13,7 +13,7 @@ config.watchFolders = [
   path.resolve(projectRoot, '../expo-module'),
 ];
 
-// Block only heavy native source trees that are not needed for JS bundling.
+// Blacklist huge directories
 const blockList = [
   /node_modules\/react-native\/ReactAndroid/,
   /node_modules\/react-native\/ReactApple/,

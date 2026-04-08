@@ -4,6 +4,9 @@ import { isLxmfNativeAvailable, LxmfModule } from './LxmfModule';
 
 export interface LxmfNodeStatus {
   running: boolean;
+  mode: number;
+  identityHex: string;
+  addressHex: string;
   lifecycle: number;
   epoch: number;
   pendingOutbound: number;
@@ -21,7 +24,7 @@ export interface Beacon {
 }
 
 export interface LxmfEvent {
-  type: 'statusChanged' | 'packetReceived' | 'txReceived' | 'beaconDiscovered' | 'messageReceived' | 'log' | 'error';
+  type: 'statusChanged' | 'packetReceived' | 'txReceived' | 'beaconDiscovered' | 'messageReceived' | 'announceReceived' | 'log' | 'error';
   [key: string]: any;
 }
 
@@ -60,7 +63,14 @@ export function useLxmf(options: UseLxmfOptions = {}) {
   const [beacons, setBeacons] = useState<Beacon[]>([]);
   const [events, setEvents] = useState<LxmfEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
   const eventBufferRef = useRef<LxmfEvent[]>([]);
+
+  const pushEvent = useCallback((type: LxmfEvent['type'], event: Record<string, any>) => {
+    const normalized = { ...event, type } as LxmfEvent;
+    eventBufferRef.current.push(normalized);
+    return normalized;
+  }, []);
 
   // Initialize the module
   useEffect(() => {
@@ -96,36 +106,40 @@ export function useLxmf(options: UseLxmfOptions = {}) {
 
     const subscriptions = [
       eventEmitter.addListener('onStatusChanged', (event) => {
-        setStatus(event);
-        eventBufferRef.current.push(event);
+        const normalized = pushEvent('statusChanged', event);
+        setStatus(normalized as unknown as LxmfNodeStatus);
       }),
       eventEmitter.addListener('onPacketReceived', (event) => {
-        eventBufferRef.current.push(event);
+        pushEvent('packetReceived', event);
       }),
       eventEmitter.addListener('onTxReceived', (event) => {
-        eventBufferRef.current.push(event);
+        pushEvent('txReceived', event);
       }),
       eventEmitter.addListener('onBeaconDiscovered', (event) => {
-        eventBufferRef.current.push(event);
+        pushEvent('beaconDiscovered', event);
       }),
       eventEmitter.addListener('onMessageReceived', (event) => {
-        eventBufferRef.current.push(event);
+        pushEvent('messageReceived', event);
+      }),
+      eventEmitter.addListener('onAnnounceReceived', (event) => {
+        pushEvent('announceReceived', event);
       }),
       eventEmitter.addListener('onLog', (event) => {
+        pushEvent('log', event);
         if (options.logLevel && options.logLevel >= event.level) {
           console.log(`[LXMF] ${event.message}`);
         }
       }),
       eventEmitter.addListener('onError', (event) => {
+        pushEvent('error', event);
         setError(`${event.code}: ${event.message}`);
-        eventBufferRef.current.push(event);
       }),
     ];
 
     return () => {
       subscriptions.forEach(sub => sub.remove());
     };
-  }, [options.logLevel]);
+  }, [options.logLevel, pushEvent]);
 
   // Poll events periodically
   useEffect(() => {
@@ -183,6 +197,8 @@ export function useLxmf(options: UseLxmfOptions = {}) {
           tcpHost,
           tcpPort,
         );
+        setRunning(true);
+        setError(null);
         return true;
       } catch (e: any) {
         setError(e.message);
@@ -195,6 +211,7 @@ export function useLxmf(options: UseLxmfOptions = {}) {
   const stop = useCallback(async () => {
     try {
       await LxmfModule.stop();
+      setRunning(false);
     } catch (e: any) {
       setError(e.message);
     }
@@ -222,7 +239,8 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     try {
       const statusJson = LxmfModule.getStatus();
       return statusJson ? JSON.parse(statusJson) : null;
-    } catch (e) {
+    } catch (e: any) {
+      setError(`Failed to parse status payload: ${e?.message ?? 'unknown error'}`);
       return null;
     }
   }, []);
@@ -231,7 +249,8 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     try {
       const beaconsJson = LxmfModule.getBeacons();
       return beaconsJson ? JSON.parse(beaconsJson) : [];
-    } catch (e) {
+    } catch (e: any) {
+      setError(`Failed to parse beacon payload: ${e?.message ?? 'unknown error'}`);
       return [];
     }
   }, []);
@@ -240,7 +259,8 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     try {
       const messagesJson = LxmfModule.fetchMessages(limit);
       return messagesJson ? JSON.parse(messagesJson) : [];
-    } catch (e) {
+    } catch (e: any) {
+      setError(`Failed to parse message payload: ${e?.message ?? 'unknown error'}`);
       return [];
     }
   }, []);
@@ -263,7 +283,7 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     beacons,
     events,
     error,
-    isRunning: LxmfModule.isRunning(),
+    isRunning: running,
     isNativeAvailable: isLxmfNativeAvailable,
 
     // Methods

@@ -1,6 +1,6 @@
 [package]
 name = "lxmf-react-native-rust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "React Native bridge for LXMF-rs mesh networking"
@@ -10,17 +10,20 @@ name = "lxmf_rn"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-# LXMF-rs embedded FFI — the core mesh networking stack
-# Using git dependency from FreeTAKTeam/LXMF-rs
-rns-embedded-ffi = { git = "https://github.com/FreeTAKTeam/LXMF-rs.git" }
+# Full Reticulum protocol stack — real identity, announces, routing, links
+reticulum-rs-transport = { git = "https://github.com/FreeTAKTeam/LXMF-rs.git" }
 
-# Core types from LXMF-rs (needed for event handling)
+# Keep embedded FFI for BLE mode (mode 0) and legacy bridge (mode 3)
+rns-embedded-ffi = { git = "https://github.com/FreeTAKTeam/LXMF-rs.git" }
 rns-embedded-core = { git = "https://github.com/FreeTAKTeam/LXMF-rs.git" }
 
-# Async runtime for event polling
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# Async runtime — needed by rns-transport
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal", "net", "io-util"] }
 
-# Serialization for beacon metadata
+# Randomness for identity generation
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -30,8 +33,11 @@ log = "0.4"
 # SQLite for message persistence
 rusqlite = { version = "0.31", features = ["bundled"] }
 
-# Hex encoding for identity/destination hashes
+# Hex encoding
 hex = "0.4"
+
+# Base64 encoding for JNI message payloads
+base64 = "0.22"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false }

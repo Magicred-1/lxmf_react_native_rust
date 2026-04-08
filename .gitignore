@@ -1,0 +1,47 @@
+# Rust
+rust-core/target/
+
+# Android
+expo-module/android/.gradle/
+expo-module/android/build/
+expo-module/android/local.properties
+*.apk
+*.aab
+
+# Android generated artifacts (all modules)
+**/android/.gradle/
+**/android/build/
+**/android/.kotlin/
+**/android/**/intermediates/
+**/android/**/outputs/
+**/android/**/tmp/
+**/android/**/kotlin-classes/
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+.npm
+
+# React Native / Expo
+.expo/
+.expo-shared/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logcat.txt
+
+# Generated files
+rust-core/src/api_probe.rs
