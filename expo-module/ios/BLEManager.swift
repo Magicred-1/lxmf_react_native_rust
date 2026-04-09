@@ -7,13 +7,13 @@ import CoreBluetooth
 /// - Central role: scans for and connects to mesh peers
 ///
 /// BLE data flows:
-///   Inbound:  peer writes to RX characteristic → push to Rust via lxmf_on_announce / packet handler
-///   Outbound: Rust node produces frames → native sends via TX characteristic notifications
+///   Inbound:  peer writes to RX characteristic → lxmf_ble_receive → Rust BleInterface
+///   Outbound: Rust BleInterface → lxmf_ble_poll_tx → TX characteristic notifications
 class BLEManager: NSObject {
-    // UUIDs matching the anon0mesh protocol
-    static let meshServiceUUID = CBUUID(string: "e9e00001-bbd4-42b1-9494-0f7256199342")
-    static let rxCharUUID      = CBUUID(string: "e9e00002-bbd4-42b1-9494-0f7256199342")
-    static let txCharUUID      = CBUUID(string: "e9e00003-bbd4-42b1-9494-0f7256199342")
+    // UUIDs must match ble_iface.rs constants exactly
+    static let meshServiceUUID = CBUUID(string: "5f3bafcd-2bb7-4de0-9c6f-2c5f88b6b8f2")
+    static let rxCharUUID      = CBUUID(string: "3b28e4f6-5a30-4a5f-b700-68bb74d1b036")
+    static let txCharUUID      = CBUUID(string: "8b6ded1a-ea65-4a1e-a1f0-5cf69d5dc2ad")
     static let rnodeServiceUUID = CBUUID(string: "0000181b-0000-1000-8000-00805f9b34fb")
 
     // Central (scanner/client)
@@ -26,6 +26,12 @@ class BLEManager: NSObject {
     private var rxCharacteristic: CBMutableCharacteristic?
     private var txCharacteristic: CBMutableCharacteristic?
     private var subscribedCentrals: [CBCentral] = []
+
+    // Peer address mapping — iOS uses 128-bit UUIDs, Rust uses 6-byte addrs.
+    // We derive a 6-byte pseudo-MAC from each UUID and maintain reverse mappings
+    // so lxmf_ble_poll_tx frames can be routed to the correct peer.
+    private var addrToPeripheralUUID: [Data: UUID] = [:]
+    private var addrToCentral: [Data: CBCentral] = [:]
 
     private var isRunning = false
 
@@ -61,6 +67,8 @@ class BLEManager: NSObject {
         }
         connectedPeripherals.removeAll()
         txCharacteristics.removeAll()
+        addrToPeripheralUUID.removeAll()
+        addrToCentral.removeAll()
 
         peripheralManager?.stopAdvertising()
         peripheralManager?.removeAllServices()
@@ -84,12 +92,45 @@ class BLEManager: NSObject {
         }
     }
 
-    /// Send data to a specific peer
+    /// Send data to a specific peer by CoreBluetooth UUID
     func sendToPeer(_ peerUUID: UUID, data: Data) {
         if let peripheral = connectedPeripherals[peerUUID],
            let char = txCharacteristics[peerUUID] {
             peripheral.writeValue(data, for: char, type: .withoutResponse)
         }
+    }
+
+    /// Send data to a specific peer by 6-byte pseudo-MAC address.
+    /// Used by drainOutgoing() to route frames from lxmf_ble_poll_tx.
+    func sendToPeerAddr(_ addr: Data, data: Data) {
+        // Try peripheral role: send notification to a subscribed central
+        if let central = addrToCentral[addr], let txChar = txCharacteristic {
+            peripheralManager?.updateValue(data, for: txChar, onSubscribedCentrals: [central])
+            return
+        }
+
+        // Try central role: write to connected peripheral's RX characteristic
+        if let peripheralUUID = addrToPeripheralUUID[addr],
+           let peripheral = connectedPeripherals[peripheralUUID],
+           let char = txCharacteristics[peripheralUUID] {
+            peripheral.writeValue(data, for: char, type: .withoutResponse)
+        }
+    }
+
+    /// Derive a 6-byte pseudo-MAC from a CoreBluetooth UUID.
+    /// XOR-folds the 16-byte UUID into 6 bytes for stable peer identification.
+    static func uuidToAddr(_ uuid: UUID) -> Data {
+        let u = uuid.uuid
+        let bytes: [UInt8] = [u.0, u.1, u.2, u.3, u.4, u.5, u.6, u.7,
+                              u.8, u.9, u.10, u.11, u.12, u.13, u.14, u.15]
+        return Data([
+            bytes[0] ^ bytes[6] ^ bytes[12],
+            bytes[1] ^ bytes[7] ^ bytes[13],
+            bytes[2] ^ bytes[8] ^ bytes[14],
+            bytes[3] ^ bytes[9] ^ bytes[15],
+            bytes[4] ^ bytes[10],
+            bytes[5] ^ bytes[11],
+        ])
     }
 
     // MARK: - Peripheral Setup
@@ -154,10 +195,24 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        // Register peer with Rust
+        let addr = BLEManager.uuidToAddr(peripheral.identifier)
+        addrToPeripheralUUID[addr] = peripheral.identifier
+        addr.withUnsafeBytes { ptr in
+            _ = lxmf_ble_connected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
+        }
+
         peripheral.discoverServices([BLEManager.meshServiceUUID, BLEManager.rnodeServiceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        // Notify Rust of disconnection
+        let addr = BLEManager.uuidToAddr(peripheral.identifier)
+        addrToPeripheralUUID.removeValue(forKey: addr)
+        addr.withUnsafeBytes { ptr in
+            _ = lxmf_ble_disconnected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
+        }
+
         connectedPeripherals.removeValue(forKey: peripheral.identifier)
         txCharacteristics.removeValue(forKey: peripheral.identifier)
 
@@ -208,12 +263,19 @@ extension BLEManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard let data = characteristic.value, !data.isEmpty else { return }
+        guard let value = characteristic.value, !value.isEmpty else { return }
 
-        // Inbound data from a mesh peer — push into Rust node
-        // The Rust layer will handle deframing, dedup, and routing
-        // For now, forward raw bytes to the FFI
-        // TODO: Route through lxmf_push_inbound when legacy API is wired
+        // Inbound data from a mesh peer — push into Rust BleInterface
+        let addr = BLEManager.uuidToAddr(peripheral.identifier)
+        addr.withUnsafeBytes { addrPtr in
+            value.withUnsafeBytes { dataPtr in
+                _ = lxmf_ble_receive(
+                    addrPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    dataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    value.count
+                )
+            }
+        }
     }
 }
 
@@ -235,9 +297,18 @@ extension BLEManager: CBPeripheralManagerDelegate {
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
         for request in requests {
             if request.characteristic.uuid == BLEManager.rxCharUUID,
-               let data = request.value {
-                // Inbound write from a central peer
-                // TODO: Push to Rust node
+               let value = request.value, !value.isEmpty {
+                // Inbound write from a central peer — push into Rust BleInterface
+                let addr = BLEManager.uuidToAddr(request.central.identifier)
+                addr.withUnsafeBytes { addrPtr in
+                    value.withUnsafeBytes { dataPtr in
+                        _ = lxmf_ble_receive(
+                            addrPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            dataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            value.count
+                        )
+                    }
+                }
             }
             peripheral.respond(to: request, withResult: .success)
         }
@@ -247,12 +318,24 @@ extension BLEManager: CBPeripheralManagerDelegate {
                            didSubscribeTo characteristic: CBCharacteristic) {
         if !subscribedCentrals.contains(where: { $0.identifier == central.identifier }) {
             subscribedCentrals.append(central)
+            // Register central as a peer with Rust
+            let addr = BLEManager.uuidToAddr(central.identifier)
+            addrToCentral[addr] = central
+            addr.withUnsafeBytes { ptr in
+                _ = lxmf_ble_connected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
+            }
         }
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral,
                            didUnsubscribeFrom characteristic: CBCharacteristic) {
         subscribedCentrals.removeAll { $0.identifier == central.identifier }
+        // Notify Rust of central disconnection
+        let addr = BLEManager.uuidToAddr(central.identifier)
+        addrToCentral.removeValue(forKey: addr)
+        addr.withUnsafeBytes { ptr in
+            _ = lxmf_ble_disconnected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
+        }
     }
 
     // Background restoration

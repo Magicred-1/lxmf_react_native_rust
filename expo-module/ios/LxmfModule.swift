@@ -7,13 +7,13 @@ func lxmf_init(_ dbPath: UnsafePointer<CChar>?) -> Int32
 
 @_silgen_name("lxmf_start")
 func lxmf_start(
-    _ identityPtr: UnsafePointer<UInt8>?,
-    _ lxmfAddressPtr: UnsafePointer<UInt8>?,
+    _ identityHex: UnsafePointer<CChar>?,
+    _ addressHex: UnsafePointer<CChar>?,
     _ mode: UInt32,
     _ announceIntervalMs: UInt64,
     _ bleMtuHint: UInt16,
-    _ tcpHost: UnsafePointer<CChar>?,
-    _ tcpPort: UInt16
+    _ tcpInterfacesJson: UnsafePointer<CChar>?,
+    _ displayName: UnsafePointer<CChar>?
 ) -> Int32
 
 @_silgen_name("lxmf_stop")
@@ -92,6 +92,35 @@ func lxmf_fetch_messages(
     _ outCapacity: Int
 ) -> Int32
 
+// --- BLE Interface FFI ---
+
+@_silgen_name("lxmf_ble_receive")
+func lxmf_ble_receive(
+    _ peerAddr: UnsafePointer<UInt8>?,
+    _ data: UnsafePointer<UInt8>?,
+    _ dataLen: Int
+) -> Int32
+
+@_silgen_name("lxmf_ble_poll_tx")
+func lxmf_ble_poll_tx(
+    _ outPeer: UnsafeMutablePointer<UInt8>?,
+    _ outData: UnsafeMutablePointer<UInt8>?,
+    _ outCapacity: Int
+) -> Int32
+
+@_silgen_name("lxmf_ble_connected")
+func lxmf_ble_connected(
+    _ peerAddr: UnsafePointer<UInt8>?
+) -> Int32
+
+@_silgen_name("lxmf_ble_disconnected")
+func lxmf_ble_disconnected(
+    _ peerAddr: UnsafePointer<UInt8>?
+) -> Int32
+
+@_silgen_name("lxmf_ble_peer_count")
+func lxmf_ble_peer_count() -> Int32
+
 
 public class LxmfModule: Module {
     // Shared JSON buffer for FFI calls (64KB)
@@ -113,6 +142,7 @@ public class LxmfModule: Module {
             "onTxReceived",
             "onBeaconDiscovered",
             "onMessageReceived",
+            "onAnnounceReceived",
             "onStatusChanged",
             "onLog",
             "onError",
@@ -137,32 +167,28 @@ public class LxmfModule: Module {
             mode: Int,
             announceIntervalMs: Double,
             bleMtuHint: Int,
-            tcpHost: String?,
-            tcpPort: Int
+            tcpInterfaces: [[String: Any]],
+            displayName: String
         ) -> Bool in
-            guard let identityBytes = Self.hexToBytes(identityHex),
-                  identityBytes.count == 32,
-                  let addressBytes = Self.hexToBytes(lxmfAddressHex),
-                  addressBytes.count == 16 else {
-                return false
+            // Serialize TCP interfaces to JSON (matches Android pattern)
+            let interfacesJson: String
+            if let data = try? JSONSerialization.data(withJSONObject: tcpInterfaces),
+               let str = String(data: data, encoding: .utf8) {
+                interfacesJson = str
+            } else {
+                interfacesJson = "[]"
             }
 
-            let result = identityBytes.withUnsafeBufferPointer { idBuf in
-                addressBytes.withUnsafeBufferPointer { addrBuf in
-                    if let host = tcpHost {
-                        return host.withCString { hostPtr in
+            let result = identityHex.withCString { idPtr in
+                lxmfAddressHex.withCString { addrPtr in
+                    interfacesJson.withCString { ifacesPtr in
+                        displayName.withCString { namePtr in
                             lxmf_start(
-                                idBuf.baseAddress, addrBuf.baseAddress,
+                                idPtr, addrPtr,
                                 UInt32(mode), UInt64(announceIntervalMs),
-                                UInt16(bleMtuHint), hostPtr, UInt16(tcpPort)
+                                UInt16(bleMtuHint), ifacesPtr, namePtr
                             )
                         }
-                    } else {
-                        return lxmf_start(
-                            idBuf.baseAddress, addrBuf.baseAddress,
-                            UInt32(mode), UInt64(announceIntervalMs),
-                            UInt16(bleMtuHint), nil, UInt16(tcpPort)
-                        )
                     }
                 }
             }
@@ -252,27 +278,39 @@ public class LxmfModule: Module {
         Function("stopBLE") { () -> Void in
             self.bleManager.stop()
         }
+
+        Function("blePeerCount") { () -> Int in
+            return Int(lxmf_ble_peer_count())
+        }
     }
 
     // MARK: - Polling
 
     private func startPolling() {
-        // RX event poll: 80ms interval
-        rxPollTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
-            self?.drainEvents()
-        }
+        // Must schedule on main thread — AsyncFunction runs on a background
+        // dispatch queue whose RunLoop is not active, so timers would never fire.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
 
-        // TX drain for BLE outgoing: 20ms interval
-        txDrainTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [weak self] _ in
-            self?.drainOutgoing()
+            // RX event poll: 80ms interval
+            self.rxPollTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+                self?.drainEvents()
+            }
+
+            // TX drain for BLE outgoing: 20ms interval
+            self.txDrainTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [weak self] _ in
+                self?.drainOutgoing()
+            }
         }
     }
 
     private func stopPolling() {
-        rxPollTimer?.invalidate()
-        rxPollTimer = nil
-        txDrainTimer?.invalidate()
-        txDrainTimer = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.rxPollTimer?.invalidate()
+            self?.rxPollTimer = nil
+            self?.txDrainTimer?.invalidate()
+            self?.txDrainTimer = nil
+        }
     }
 
     private func drainEvents() {
@@ -299,6 +337,8 @@ public class LxmfModule: Module {
                 sendEvent("onBeaconDiscovered", event)
             case "messageReceived":
                 sendEvent("onMessageReceived", event)
+            case "announceReceived":
+                sendEvent("onAnnounceReceived", event)
             case "log":
                 sendEvent("onLog", event)
             case "error":
@@ -310,7 +350,23 @@ public class LxmfModule: Module {
     }
 
     private func drainOutgoing() {
-        // Future: drain outgoing packets from Rust node and write to BLE
+        // Poll Rust for outbound BLE frames and send to peers.
+        // Max 8 frames per 20ms tick to avoid blocking the run loop.
+        var peerAddr = [UInt8](repeating: 0, count: 6)
+        var dataBuf = [UInt8](repeating: 0, count: 512)
+
+        for _ in 0..<8 {
+            let len = peerAddr.withUnsafeMutableBufferPointer { peerBuf in
+                dataBuf.withUnsafeMutableBufferPointer { dataBuf in
+                    lxmf_ble_poll_tx(peerBuf.baseAddress, dataBuf.baseAddress, dataBuf.count)
+                }
+            }
+            guard len > 0 else { break }
+
+            let frameData = Data(dataBuf[0..<Int(len)])
+            let addr = Data(peerAddr)
+            bleManager.sendToPeerAddr(addr, data: frameData)
+        }
     }
 
     // MARK: - Helpers

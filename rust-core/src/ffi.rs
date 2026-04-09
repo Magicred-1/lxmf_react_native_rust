@@ -176,6 +176,66 @@ pub unsafe extern "C" fn lxmf_fetch_messages(
     bytes.len() as i32
 }
 
+// --- Messaging ---
+
+/// Send an LXMF message to a single destination.
+///
+/// `dest_ptr` — pointer to 16-byte destination hash.
+/// `body_ptr` — pointer to message body bytes.
+/// `body_len` — length of body.
+///
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_send(
+    dest_ptr: *const u8,
+    body_ptr: *const u8,
+    body_len: usize,
+) -> i64 {
+    if dest_ptr.is_null() || body_ptr.is_null() { return -1; }
+    if body_len > 65536 { return -1; } // sanity cap
+
+    let dest_bytes = slice::from_raw_parts(dest_ptr, 16);
+    let dest_hex = hex::encode(dest_bytes);
+    let body = slice::from_raw_parts(body_ptr, body_len);
+
+    match LxmfNode::send_to(&dest_hex, body) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Broadcast an LXMF message to multiple destinations.
+///
+/// `dests_ptr`  — pointer to flat array of 16-byte destination hashes.
+/// `dest_count` — number of destinations (each 16 bytes).
+/// `body_ptr`   — pointer to message body bytes.
+/// `body_len`   — length of body.
+///
+/// Returns number of successful sends, or -1 on invalid input.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_broadcast(
+    dests_ptr: *const u8,
+    dest_count: usize,
+    body_ptr: *const u8,
+    body_len: usize,
+) -> i64 {
+    if dests_ptr.is_null() || body_ptr.is_null() { return -1; }
+    if dest_count == 0 { return 0; }
+    if body_len > 65536 { return -1; }
+
+    let dests = slice::from_raw_parts(dests_ptr, dest_count * 16);
+    let body = slice::from_raw_parts(body_ptr, body_len);
+
+    let mut sent: i64 = 0;
+    for i in 0..dest_count {
+        let dest_hex = hex::encode(&dests[i * 16..(i + 1) * 16]);
+        if LxmfNode::send_to(&dest_hex, body).is_ok() {
+            sent += 1;
+        }
+    }
+    sent
+}
+
 // --- Config ---
 
 #[no_mangle]
@@ -209,6 +269,86 @@ pub unsafe extern "C" fn lxmf_kiss_encode(
     if encoded.len() > out_capacity { return STATUS_ERR; }
     std::ptr::copy_nonoverlapping(encoded.as_ptr(), out_ptr, encoded.len());
     encoded.len() as i32
+}
+
+// --- BLE Interface (iOS C FFI) ---
+//
+// These mirror the JNI BLE functions in jni_bridge.rs.
+// Swift calls these via @_silgen_name from BLEManager / LxmfModule.
+
+/// Push inbound BLE data from a peer into the Rust transport engine.
+///
+/// `peer_addr` — pointer to 6-byte peer address (pseudo-MAC derived from CoreBluetooth UUID).
+/// `data`      — pointer to raw BLE characteristic bytes.
+/// `data_len`  — number of bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_ble_receive(
+    peer_addr: *const u8,
+    data: *const u8,
+    data_len: usize,
+) -> i32 {
+    if peer_addr.is_null() || data.is_null() { return STATUS_ERR; }
+    if data_len == 0 || data_len > 4096 { return STATUS_ERR; }
+    let mut addr = [0u8; 6];
+    addr.copy_from_slice(slice::from_raw_parts(peer_addr, 6));
+    let bytes = slice::from_raw_parts(data, data_len).to_vec();
+    crate::ble_iface::on_ble_rx(addr, bytes);
+    STATUS_OK
+}
+
+/// Dequeue the next outbound BLE frame from the Rust transport engine.
+///
+/// `out_peer`     — pointer to a 6-byte buffer; receives the target peer address.
+/// `out_data`     — pointer to a data buffer; receives the frame bytes.
+/// `out_capacity` — size of the data buffer.
+///
+/// Returns: positive = number of data bytes written, 0 = nothing queued, negative = error.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_ble_poll_tx(
+    out_peer: *mut u8,
+    out_data: *mut u8,
+    out_capacity: usize,
+) -> i32 {
+    if out_peer.is_null() || out_data.is_null() { return STATUS_ERR; }
+    match crate::ble_iface::next_ble_tx() {
+        Some(frame) => {
+            if frame.data.len() > out_capacity { return STATUS_ERR; }
+            std::ptr::copy_nonoverlapping(frame.peer_addr.as_ptr(), out_peer, 6);
+            std::ptr::copy_nonoverlapping(frame.data.as_ptr(), out_data, frame.data.len());
+            frame.data.len() as i32
+        }
+        None => 0,
+    }
+}
+
+/// Notify Rust that a BLE peer has connected.
+///
+/// `peer_addr` — pointer to 6-byte peer address.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_ble_connected(peer_addr: *const u8) -> i32 {
+    if peer_addr.is_null() { return STATUS_ERR; }
+    let mut addr = [0u8; 6];
+    addr.copy_from_slice(slice::from_raw_parts(peer_addr, 6));
+    crate::ble_iface::on_ble_connected(addr);
+    STATUS_OK
+}
+
+/// Notify Rust that a BLE peer has disconnected.
+///
+/// `peer_addr` — pointer to 6-byte peer address.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_ble_disconnected(peer_addr: *const u8) -> i32 {
+    if peer_addr.is_null() { return STATUS_ERR; }
+    let mut addr = [0u8; 6];
+    addr.copy_from_slice(slice::from_raw_parts(peer_addr, 6));
+    crate::ble_iface::on_ble_disconnected(addr);
+    STATUS_OK
+}
+
+/// Returns the number of currently connected BLE peers.
+#[no_mangle]
+pub extern "C" fn lxmf_ble_peer_count() -> i32 {
+    crate::ble_iface::ble_peer_count() as i32
 }
 
 // --- Internal ---

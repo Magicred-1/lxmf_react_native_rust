@@ -16,7 +16,7 @@
   },
   "sideEffects": false,
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"const ts=require('typescript');const c=ts.readConfigFile('./tsconfig.json',ts.sys.readFile);const p=ts.parseJsonConfigFileContent(c.config,ts.sys,'./');const prog=ts.createProgram(p.fileNames,p.options);const r=prog.emit();const d=ts.getPreEmitDiagnostics(prog).concat(r.diagnostics);if(d.length){d.forEach(x=>console.error(ts.flattenDiagnosticMessageText(x.messageText,'\\n')));process.exit(1)}\"",
     "clean": "rm -rf build",
     "prepare": "npm run build",
     "prepublishOnly": "npm run clean && npm run build",
@@ -59,7 +59,7 @@
   "devDependencies": {
     "@types/react": "^19.2.14",
     "@types/react-native": "^0.72.0",
-    "expo-modules-core": "^1.12.26",
+    "expo-modules-core": "^3.0.0",
     "typescript": "^5.0.0"
   },
   "files": [
