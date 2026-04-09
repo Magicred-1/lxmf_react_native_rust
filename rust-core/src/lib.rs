@@ -8,6 +8,7 @@
 
 pub mod node;
 pub mod beacon;
+pub mod ble_iface;
 pub mod ffi;
 pub mod framing;
 pub mod log_bridge;

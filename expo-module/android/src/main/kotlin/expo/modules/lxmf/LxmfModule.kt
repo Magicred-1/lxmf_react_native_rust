@@ -19,6 +19,9 @@ class LxmfModule : Module() {
     }
   }
 
+  // BleManager is created lazily when the app context is available
+  private var bleManager: BleManager? = null
+
   override fun definition() = ModuleDefinition {
     Name("LxmfModule")
 
@@ -40,10 +43,18 @@ class LxmfModule : Module() {
       } else {
         Log.w(TAG, "Skipping event polling because liblxmf_rn is not loaded")
       }
+      // Create BleManager with whatever Android context is available in this lifecycle phase
+      val ctx = appContext.reactContext?.applicationContext
+        ?: appContext.currentActivity?.applicationContext
+      if (ctx != null) {
+        bleManager = BleManager(ctx, this@LxmfModule)
+      }
     }
 
     OnDestroy {
       pollHandler.removeCallbacks(pollRunnable)
+      bleManager?.stop()
+      bleManager = null
     }
 
     // Lifecycle
@@ -55,10 +66,16 @@ class LxmfModule : Module() {
 
     AsyncFunction("start") { identityHex: String, lxmfAddressHex: String, mode: Int,
                               announceIntervalMs: Double, bleMtuHint: Int,
-                              tcpHost: String?, tcpPort: Int ->
-      Log.d(TAG, "start() mode=$mode host=$tcpHost port=$tcpPort")
+                              tcpInterfaces: List<Map<String, Any>>, displayName: String ->
+      Log.d(TAG, "start() mode=$mode interfaces=$tcpInterfaces name=$displayName")
+      val interfacesJson = org.json.JSONArray(tcpInterfaces.map { iface ->
+        org.json.JSONObject().apply {
+          put("host", iface["host"] ?: "")
+          put("port", iface["port"] ?: 0)
+        }
+      }).toString()
       val rc = nativeStart(identityHex, lxmfAddressHex, mode, announceIntervalMs.toLong(),
-                  bleMtuHint.toShort(), tcpHost, tcpPort.toShort())
+                  bleMtuHint.toShort(), interfacesJson, displayName)
       if (rc != 0) throw RuntimeException("nativeStart returned $rc")
       true
     }
@@ -105,9 +122,22 @@ class LxmfModule : Module() {
       nativeAbiVersion()
     }
 
-    // BLE Control
-    Function("startBLE") { }
-    Function("stopBLE") { }
+    // BLE Control — starts/stops BLE scan+advertise+GATT bridge to Rust
+    Function("startBLE") {
+      Log.d(TAG, "startBLE()")
+      bleManager?.start()
+      true
+    }
+
+    Function("stopBLE") {
+      Log.d(TAG, "stopBLE()")
+      bleManager?.stop()
+      true
+    }
+
+    Function("blePeerCount") {
+      nativeBlePeerCount()
+    }
   }
 
   private fun drainAndEmitEvents() {
@@ -159,8 +189,8 @@ class LxmfModule : Module() {
     mode: Int,
     announceIntervalMs: Long,
     bleMtuHint: Short,
-    tcpHost: String?,
-    tcpPort: Short
+    tcpInterfacesJson: String,
+    displayName: String
   ): Int
   private external fun nativeStop(): Int
   private external fun nativeIsRunning(): Boolean
@@ -172,6 +202,15 @@ class LxmfModule : Module() {
   private external fun nativeFetchMessages(limit: Int): String?
   private external fun nativeSetLogLevel(level: Int): Int
   private external fun nativeAbiVersion(): Int
+
+  // BLE JNI — called by BleManager (same package)
+  // Must NOT be `internal` — Kotlin mangles internal function names in JVM bytecode,
+  // which breaks JNI symbol resolution (produces e.g. nativeBlePollTx$lxmf_react_native_debug).
+  external fun nativeBleReceive(peerAddr: ByteArray, data: ByteArray)
+  external fun nativeBlePollTx(): String?
+  external fun nativeBleConnected(peerAddr: ByteArray)
+  external fun nativeBleDisconnected(peerAddr: ByteArray)
+  external fun nativeBlePeerCount(): Int
 
   companion object {
     @Volatile

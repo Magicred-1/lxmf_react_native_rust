@@ -9,8 +9,8 @@ export interface NativeModuleType extends NativeModule {
     mode: number,
     announceIntervalMs: number,
     bleMtuHint: number,
-    tcpHost: string | null,
-    tcpPort: number
+    tcpInterfaces: { host: string; port: number }[],
+    displayName: string
   ): Promise<boolean>;
   stop(): Promise<boolean>;
   isRunning(): boolean;
@@ -29,8 +29,9 @@ export interface NativeModuleType extends NativeModule {
   abiVersion(): number;
 
   // BLE Control
-  startBLE(): void;
-  stopBLE(): void;
+  startBLE(): boolean;
+  stopBLE(): boolean;
+  blePeerCount(): number;
 }
 
 const MISSING_NATIVE_MESSAGE =
@@ -58,6 +59,7 @@ const missingNativeShim: NativeModuleType = {
   abiVersion: () => throwMissingNative(),
   startBLE: () => throwMissingNative(),
   stopBLE: () => throwMissingNative(),
+  blePeerCount: () => throwMissingNative(),
 } as NativeModuleType;
 
 export const LxmfModule = LxmfModuleNative ?? missingNativeShim;

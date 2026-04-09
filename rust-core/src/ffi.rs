@@ -37,8 +37,8 @@ pub unsafe extern "C" fn lxmf_start(
     mode: u32,
     announce_interval_ms: u64,
     ble_mtu_hint: u16,
-    tcp_host: *const c_char,
-    tcp_port: u16,
+    tcp_interfaces_json: *const c_char,
+    display_name: *const c_char,
 ) -> i32 {
     let id = if identity_hex.is_null() { "" } else {
         match CStr::from_ptr(identity_hex).to_str() { Ok(s) => s, Err(_) => return STATUS_ERR }
@@ -46,11 +46,14 @@ pub unsafe extern "C" fn lxmf_start(
     let addr = if address_hex.is_null() { "" } else {
         match CStr::from_ptr(address_hex).to_str() { Ok(s) => s, Err(_) => return STATUS_ERR }
     };
-    let host = if tcp_host.is_null() { None } else {
-        CStr::from_ptr(tcp_host).to_str().ok()
+    let interfaces = if tcp_interfaces_json.is_null() { "[]" } else {
+        match CStr::from_ptr(tcp_interfaces_json).to_str() { Ok(s) => s, Err(_) => return STATUS_ERR }
+    };
+    let name = if display_name.is_null() { "" } else {
+        match CStr::from_ptr(display_name).to_str() { Ok(s) => s, Err(_) => return STATUS_ERR }
     };
 
-    match LxmfNode::start(id, addr, mode, announce_interval_ms, ble_mtu_hint, host, tcp_port) {
+    match LxmfNode::start(id, addr, mode, announce_interval_ms, ble_mtu_hint, interfaces, name) {
         Ok(()) => STATUS_OK,
         Err(_) => STATUS_ERR,
     }

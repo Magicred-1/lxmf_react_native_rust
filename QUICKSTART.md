@@ -191,7 +191,7 @@ ls ../rust-core/target/release/liblxmf_rn.*
 cd ../rust-core
 cargo build --release
 cd ../example-app
-npm start
+npx expo run:android / npx expo run:ios
 ```
 
 ### "Failed to start LXMF node" on iOS
@@ -207,6 +207,9 @@ npm start
 # Rebuild Rust for Android:
 cd ../rust-core
 cargo build --release --target aarch64-linux-android
+
+# Rebuild iOS static library:
+cargo build --release --target aarch64-apple-ios
 
 # Clean gradle cache:
 cd ../expo-module/android

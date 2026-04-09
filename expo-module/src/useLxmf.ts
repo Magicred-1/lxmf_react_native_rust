@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { isLxmfNativeAvailable, LxmfModule, LxmfModuleNative } from './LxmfModule';
 
 export interface LxmfNodeStatus {
@@ -13,6 +13,7 @@ export interface LxmfNodeStatus {
   inboundAccepted: number;
   announcesReceived: number;
   lxmfMessagesReceived: number;
+  blePeerCount: number;
 }
 
 export interface Beacon {
@@ -39,22 +40,36 @@ export enum LxmfNodeMode {
   Reticulum = 3,
 }
 
+export interface TcpInterface {
+  host: string;
+  port: number;
+}
+
 export interface UseLxmfOptions {
   autoStart?: boolean;
   identityHex?: string;
   lxmfAddressHex?: string;
   dbPath?: string;
   logLevel?: number;
-  /** Transport mode — BLE, TCP client, or TCP server. Default: BleOnly */
+  /** Transport mode — BLE or Reticulum TCP. Default: BleOnly */
   mode?: LxmfNodeMode;
-  /** TCP host to connect to (client) or bind on (server). Required when mode is TCP. */
-  tcpHost?: string;
-  /** TCP port. Required when mode is TCP. */
-  tcpPort?: number;
+  /** One or more TCP interfaces to connect to (required for Reticulum mode). */
+  tcpInterfaces?: TcpInterface[];
   /** Announce interval in ms. Default: 5000 */
   announceIntervalMs?: number;
   /** BLE MTU hint. Default: 255 */
   bleMtuHint?: number;
+  /** Display name broadcast in LXMF announces. Default: "lxmf-mobile" */
+  displayName?: string;
+}
+
+function parseJson<T>(value: string | null, fallback: T): T {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
 }
 
 export function useLxmf(options: UseLxmfOptions = {}) {
@@ -63,15 +78,22 @@ export function useLxmf(options: UseLxmfOptions = {}) {
   const [events, setEvents] = useState<LxmfEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
-  const eventBufferRef = useRef<LxmfEvent[]>([]);
 
-  const pushEvent = useCallback((type: LxmfEvent['type'], event: Record<string, any>) => {
-    const normalized = { ...event, type } as LxmfEvent;
-    eventBufferRef.current.push(normalized);
-    return normalized;
+  const pushEvent = useCallback((type: LxmfEvent['type'], payload: Record<string, any>) => {
+    const event = { ...payload, type } as LxmfEvent;
+    setEvents((prev: LxmfEvent[]) => [event, ...prev].slice(0, 200));
+    return event;
   }, []);
 
-  // Initialize the module
+  const syncStatus = useCallback(() => {
+    const parsed = parseJson<LxmfNodeStatus | null>(LxmfModule.getStatus(), null);
+    setStatus(parsed);
+    if (parsed && typeof parsed.running === 'boolean') {
+      setRunning(parsed.running);
+    }
+    return parsed;
+  }, []);
+
   useEffect(() => {
     if (!isLxmfNativeAvailable) {
       setError(
@@ -80,42 +102,29 @@ export function useLxmf(options: UseLxmfOptions = {}) {
       return;
     }
 
-    const init = () => {
-      try {
-        const dbPath = options.dbPath || null;
-        const success = LxmfModule.init(dbPath);
-        if (!success) {
-          setError('Failed to initialize LXMF module');
-          return;
-        }
-        // Sync running state and status on mount (node may already be running)
-        const alreadyRunning = LxmfModule.isRunning();
-        setRunning(alreadyRunning);
-        if (alreadyRunning) {
-          try {
-            const statusJson = LxmfModule.getStatus();
-            if (statusJson) setStatus(JSON.parse(statusJson) as LxmfNodeStatus);
-          } catch {}
-        }
-      } catch (e: any) {
-        setError(e.message);
+    try {
+      const initialized = LxmfModule.init(options.dbPath || null);
+      if (!initialized) {
+        setError('Failed to initialize LXMF module');
+        return;
       }
-    };
 
-    init();
-  }, [options.dbPath]);
+      const alreadyRunning = LxmfModule.isRunning();
+      setRunning(alreadyRunning);
+      if (alreadyRunning) {
+        syncStatus();
+      }
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message ?? 'Initialization failed');
+    }
+  }, [options.dbPath, syncStatus]);
 
-  // Event listeners
-  // In Expo SDK 50+, NativeModule IS the EventEmitter (C++ implementation).
-  // Call addListener() directly on the native module — NativeEventEmitter does NOT work.
   useEffect(() => {
     if (!isLxmfNativeAvailable || !LxmfModuleNative) {
       return;
     }
 
-    // Cast to any: NativeModule<Record<never,never>> makes addListener's event names `never`,
-    // but at runtime the Expo C++ EventEmitter implements addListener for all declared events.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const mod = LxmfModuleNative as any;
 
     const subscriptions = [
@@ -124,11 +133,7 @@ export function useLxmf(options: UseLxmfOptions = {}) {
         if (typeof event.running === 'boolean') {
           setRunning(event.running);
         }
-        // Fetch complete status (event only has running+lifecycle, not identity/mode)
-        try {
-          const statusJson = LxmfModule.getStatus();
-          if (statusJson) setStatus(JSON.parse(statusJson) as LxmfNodeStatus);
-        } catch {}
+        syncStatus();
       }),
       mod.addListener('onPacketReceived', (event: Record<string, any>) => {
         pushEvent('packetReceived', event);
@@ -138,6 +143,8 @@ export function useLxmf(options: UseLxmfOptions = {}) {
       }),
       mod.addListener('onBeaconDiscovered', (event: Record<string, any>) => {
         pushEvent('beaconDiscovered', event);
+        const latestBeacons = parseJson<Beacon[]>(LxmfModule.getBeacons(), []);
+        setBeacons(latestBeacons);
       }),
       mod.addListener('onMessageReceived', (event: Record<string, any>) => {
         pushEvent('messageReceived', event);
@@ -147,7 +154,7 @@ export function useLxmf(options: UseLxmfOptions = {}) {
       }),
       mod.addListener('onLog', (event: Record<string, any>) => {
         pushEvent('log', event);
-        if (options.logLevel && options.logLevel >= (event.level as number)) {
+        if (typeof options.logLevel === 'number' && options.logLevel >= Number(event.level ?? 0)) {
           console.log(`[LXMF] ${String(event.message)}`);
         }
       }),
@@ -160,28 +167,15 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     return () => {
       subscriptions.forEach((sub: { remove: () => void }) => sub.remove());
     };
-  }, [options.logLevel, pushEvent]);
+  }, [options.logLevel, pushEvent, syncStatus]);
 
-  // Poll events periodically
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (eventBufferRef.current.length > 0) {
-        setEvents([...eventBufferRef.current]);
-        eventBufferRef.current = [];
-      }
-    }, 100);
-
-    return () => clearInterval(interval);
-  }, []);
-
-  // Start/stop the node
   const start = useCallback(
     async (overrides?: {
       identityHex?: string;
       lxmfAddressHex?: string;
       mode?: LxmfNodeMode;
-      tcpHost?: string;
-      tcpPort?: number;
+      tcpInterfaces?: TcpInterface[];
+      displayName?: string;
     }) => {
       try {
         if (!isLxmfNativeAvailable) {
@@ -199,13 +193,13 @@ export function useLxmf(options: UseLxmfOptions = {}) {
         }
 
         const mode = overrides?.mode ?? options.mode ?? LxmfNodeMode.BleOnly;
-        const tcpHost = overrides?.tcpHost ?? options.tcpHost ?? null;
-        const tcpPort = overrides?.tcpPort ?? options.tcpPort ?? 0;
+        const tcpInterfaces = overrides?.tcpInterfaces ?? options.tcpInterfaces ?? [];
         const announceMs = options.announceIntervalMs ?? 5000;
         const bleMtu = options.bleMtuHint ?? 255;
+        const displayName = overrides?.displayName ?? options.displayName ?? '';
 
-        if (mode !== LxmfNodeMode.BleOnly && !tcpHost) {
-          setError(`Mode ${mode} requires a tcpHost.`);
+        if (mode !== LxmfNodeMode.BleOnly && tcpInterfaces.length === 0) {
+          setError(`Mode ${mode} requires at least one TCP interface.`);
           return false;
         }
 
@@ -215,27 +209,46 @@ export function useLxmf(options: UseLxmfOptions = {}) {
           mode,
           announceMs,
           bleMtu,
-          tcpHost,
-          tcpPort,
+          tcpInterfaces,
+          displayName,
         );
         setRunning(true);
+        syncStatus();
         setError(null);
         return true;
       } catch (e: any) {
-        setError(e.message);
+        setError(e?.message ?? 'Failed to start');
         return false;
       }
     },
-    [options.identityHex, options.lxmfAddressHex, options.mode, options.tcpHost, options.tcpPort, options.announceIntervalMs, options.bleMtuHint]
+    [
+      options.identityHex,
+      options.lxmfAddressHex,
+      options.mode,
+      options.tcpInterfaces,
+      options.announceIntervalMs,
+      options.bleMtuHint,
+      options.displayName,
+      syncStatus,
+    ]
   );
+
+  useEffect(() => {
+    if (!options.autoStart || running) return;
+    if (!options.identityHex || !options.lxmfAddressHex) return;
+    start().catch(() => {
+      // start() already sets error state on failure
+    });
+  }, [options.autoStart, options.identityHex, options.lxmfAddressHex, running, start]);
 
   const stop = useCallback(async () => {
     try {
       await LxmfModule.stop();
       setRunning(false);
       setStatus(null);
+      setError(null);
     } catch (e: any) {
-      setError(e.message);
+      setError(e?.message ?? 'Failed to stop');
     }
   }, []);
 
@@ -259,20 +272,18 @@ export function useLxmf(options: UseLxmfOptions = {}) {
 
   const getStatus = useCallback(() => {
     try {
-      const statusJson = LxmfModule.getStatus();
-      const parsed = statusJson ? (JSON.parse(statusJson) as LxmfNodeStatus) : null;
-      if (parsed) setStatus(parsed);
-      return parsed;
+      return syncStatus();
     } catch (e: any) {
       setError(`Failed to parse status payload: ${e?.message ?? 'unknown error'}`);
       return null;
     }
-  }, []);
+  }, [syncStatus]);
 
   const getBeacons = useCallback(() => {
     try {
-      const beaconsJson = LxmfModule.getBeacons();
-      return beaconsJson ? JSON.parse(beaconsJson) : [];
+      const parsed = parseJson<Beacon[]>(LxmfModule.getBeacons(), []);
+      setBeacons(parsed);
+      return parsed;
     } catch (e: any) {
       setError(`Failed to parse beacon payload: ${e?.message ?? 'unknown error'}`);
       return [];
@@ -281,8 +292,7 @@ export function useLxmf(options: UseLxmfOptions = {}) {
 
   const fetchMessages = useCallback((limit: number = 50) => {
     try {
-      const messagesJson = LxmfModule.fetchMessages(limit);
-      return messagesJson ? JSON.parse(messagesJson) : [];
+      return parseJson<any[]>(LxmfModule.fetchMessages(limit), []);
     } catch (e: any) {
       setError(`Failed to parse message payload: ${e?.message ?? 'unknown error'}`);
       return [];

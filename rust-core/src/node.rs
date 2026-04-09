@@ -14,6 +14,7 @@ use log::{info, warn};
 use serde_json;
 
 use crate::beacon::BeaconManager;
+use crate::ble_iface::BleInterface;
 use crate::store::MessageStore;
 
 use rns_transport::transport::Transport;
@@ -106,6 +107,9 @@ impl LxmfNode {
             transport: None,
         };
 
+        // Clear stale BLE peer list from any previous session in this process
+        crate::ble_iface::clear_ble_peers();
+
         let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
         *guard = Some(node);
         info!("LxmfNode: initialized");
@@ -115,19 +119,25 @@ impl LxmfNode {
     /// Start the node.
     /// mode 0: BLE only (embedded FFI)
     /// mode 3: Standard Reticulum TCP via rns-transport
+    ///
+    /// `interfaces_json` is a JSON array of `{"host": "...", "port": 1234}` objects.
+    /// At least one entry is required for mode 3.
     pub fn start(
         identity_hex: &str,
         address_hex: &str,
         mode: u32,
         announce_interval_ms: u64,
         _ble_mtu_hint: u16,
-        tcp_host: Option<&str>,
-        tcp_port: u16,
+        interfaces_json: &str,
+        display_name: &str,
     ) -> Result<(), String> {
-        info!("LxmfNode::start mode={} host={:?} port={}", mode, tcp_host, tcp_port);
+        info!("LxmfNode::start mode={} interfaces={} name={}", mode, interfaces_json, display_name);
 
         match mode {
-            3 => Self::start_reticulum(identity_hex, address_hex, tcp_host, tcp_port, announce_interval_ms),
+            3 => {
+                let interfaces = parse_interfaces_json(interfaces_json)?;
+                Self::start_reticulum(identity_hex, address_hex, &interfaces, announce_interval_ms, display_name)
+            }
             0 => Self::start_ble(identity_hex, address_hex),
             _ => Err(format!("Unsupported mode: {}. Use 0 (BLE) or 3 (Reticulum TCP)", mode)),
         }
@@ -137,17 +147,18 @@ impl LxmfNode {
     fn start_reticulum(
         identity_hex: &str,
         address_hex: &str,
-        tcp_host: Option<&str>,
-        tcp_port: u16,
+        interfaces: &[(String, u16)],
         announce_interval_ms: u64,
+        display_name: &str,
     ) -> Result<(), String> {
         use rns_transport::identity::PrivateIdentity;
         use rns_transport::transport::TransportConfig;
         use rns_transport::destination::DestinationName;
         use rns_transport::iface::tcp_client::TcpClient;
 
-        let host = tcp_host.ok_or("Reticulum TCP mode requires a tcpHost")?;
-        let addr = format!("{}:{}", host, tcp_port);
+        if interfaces.is_empty() {
+            return Err("Reticulum TCP mode requires at least one interface".into());
+        }
 
         // Create or restore identity
         let private_identity = if identity_hex.len() == 128 {
@@ -161,10 +172,9 @@ impl LxmfNode {
         };
 
         let id_hex = private_identity.to_hex_string();
-        let addr_hash = private_identity.address_hash();
-        let addr_hex = hex::encode(addr_hash.as_slice());
+        // addr_hex is set later from my_dest.desc.address_hash (LXMF delivery destination hash)
 
-        info!("LxmfNode: identity={} address={}", &id_hex[..16], addr_hex);
+        info!("LxmfNode: identity={}", &id_hex[..16]);
 
         // Store identity bytes for persistence
         let id_bytes = private_identity.to_private_key_bytes().to_vec();
@@ -178,36 +188,57 @@ impl LxmfNode {
 
         let rt = get_runtime();
 
+        // Clamp display name to 32 bytes, fall back to "lxmf-mobile"
+        let name_bytes: Vec<u8> = if display_name.is_empty() {
+            b"lxmf-mobile".to_vec()
+        } else {
+            display_name.as_bytes()[..display_name.len().min(32)].to_vec()
+        };
+
         // Set up transport synchronously so we can store the handle
-        let (transport_arc, my_dest, mut data_rx, announce_rx) = rt.block_on(async {
+        let name_bytes_init = name_bytes.clone();
+        let (transport_arc, my_dest, mut data_rx, announce_rx, lxmf_addr_hex) = rt.block_on(async move {
             let config = TransportConfig::new("lxmf-mobile", &private_identity, true);
             let mut transport = Transport::new(config);
 
-            // Add TCP interface to reach the network
+            // Add all TCP interfaces
             {
                 let iface_mgr = transport.iface_manager();
                 let mut mgr = iface_mgr.lock().await;
-                info!("LxmfNode: connecting TCP to {}", addr);
-                mgr.spawn(TcpClient::new(&addr), TcpClient::spawn);
+                for (host, port) in interfaces {
+                    let addr = format!("{}:{}", host, port);
+                    info!("LxmfNode: connecting TCP to {}", addr);
+                    mgr.spawn(TcpClient::new(&addr), TcpClient::spawn);
+                }
             }
 
             // Register LXMF delivery destination
             let dest_name = DestinationName::new("lxmf", "delivery");
             let my_dest = transport.add_destination(private_identity.clone(), dest_name).await;
 
+            // Extract the LXMF delivery destination hash while we still have async context.
+            // This is Hash(name_hash + identity_address_hash) — NOT the raw identity hash.
+            // Peers must send to this address, and we embed it as source in outgoing messages.
+            let lxmf_addr_hex = {
+                let d = my_dest.lock().await;
+                hex::encode(d.desc.address_hash.as_slice())
+            };
+
             // Give the TCP interface time to connect
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-            // Send initial announce
-            info!("LxmfNode: sending announce");
-            transport.send_announce(&my_dest, Some(b"lxmf-mobile")).await;
+            // Send initial announce with display name as app_data
+            info!("LxmfNode: sending announce as {}", lxmf_addr_hex);
+            transport.send_announce(&my_dest, Some(name_bytes_init.as_slice())).await;
 
             let data_rx = transport.received_data_events();
             let announce_rx = transport.recv_announces().await;
 
             let arc = Arc::new(tokio::sync::Mutex::new(transport));
-            (arc, my_dest, data_rx, announce_rx)
+            (arc, my_dest, data_rx, announce_rx, lxmf_addr_hex)
         });
+
+        let addr_hex = lxmf_addr_hex;
 
         // Push status event
         if let Ok(mut eq) = events.lock() {
@@ -282,10 +313,12 @@ impl LxmfNode {
                 transport_reannounce
                     .lock()
                     .await
-                    .send_announce(&my_dest, Some(b"lxmf-mobile"))
+                    .send_announce(&my_dest, Some(name_bytes.as_slice()))
                     .await;
             }
         });
+
+        info!("LxmfNode: LXMF delivery address = {}", addr_hex);
 
         // Update node state
         let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
@@ -301,17 +334,27 @@ impl LxmfNode {
         Ok(())
     }
 
-    /// Send data to a destination identified by its 32-char hex address hash.
-    /// The transport handles encryption using the destination's announced public key.
-    pub fn send_to(dest_hex: &str, data: &[u8]) -> Result<(), String> {
+    /// Send an LXMF message to a destination.
+    ///
+    /// Encodes content as a proper LXMF wire message:
+    ///   [16B dest_hash][16B source_hash][64B Ed25519 sig][msgpack payload]
+    /// where msgpack payload = [timestamp: f64, title: bytes, content: bytes, fields: {}]
+    ///
+    /// The Reticulum transport then encrypts and routes the packet.
+    pub fn send_to(dest_hex: &str, content: &[u8]) -> Result<(), String> {
         use rns_transport::hash::AddressHash;
+        use rns_transport::identity::PrivateIdentity;
         use rns_transport::packet::{Packet, PacketDataBuffer};
         use rns_transport::transport::SendPacketOutcome;
 
-        let transport = {
+        let (transport, identity_bytes, source_hash_bytes) = {
             let guard = Self::global().lock().map_err(|e| e.to_string())?;
             let node = guard.as_ref().ok_or("Node not initialized")?;
-            node.transport.clone().ok_or("Transport not started (mode 3 only)")?
+            let transport = node.transport.clone().ok_or("Transport not started (mode 3 only)")?;
+            let id_bytes = node.identity_bytes.clone().ok_or("No identity available")?;
+            let addr_hex = node.address_hex.clone();
+            let src = hex::decode(&addr_hex).map_err(|e| format!("Bad address hex: {e}"))?;
+            (transport, id_bytes, src)
         };
 
         let dest_bytes = hex::decode(dest_hex)
@@ -319,12 +362,43 @@ impl LxmfNode {
         if dest_bytes.len() != 16 {
             return Err(format!("dest must be 16 bytes (32 hex chars), got {}", dest_bytes.len()));
         }
+        if source_hash_bytes.len() != 16 {
+            return Err(format!("source address must be 16 bytes, got {}", source_hash_bytes.len()));
+        }
+
         let mut dest_arr = [0u8; 16];
         dest_arr.copy_from_slice(&dest_bytes);
 
+        // Rebuild identity for signing
+        let private_identity = PrivateIdentity::from_private_key_bytes(&identity_bytes)
+            .map_err(|e| format!("Failed to restore identity: {:?}", e))?;
+
+        // Encode LXMF msgpack payload: [timestamp: f64, title: bin, content: bin, fields: fixmap{}]
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let msgpack = encode_lxmf_msgpack(timestamp, b"", content);
+
+        // Build: dest_hash(16) + source_hash(16) + signature(64) + msgpack
+        // Signature covers: dest_hash + source_hash + msgpack
+        let mut sign_data = Vec::with_capacity(16 + 16 + msgpack.len());
+        sign_data.extend_from_slice(&dest_arr);
+        sign_data.extend_from_slice(&source_hash_bytes);
+        sign_data.extend_from_slice(&msgpack);
+        let signature = private_identity.sign(&sign_data).to_bytes();
+
+        let mut lxmf_payload = Vec::with_capacity(16 + 16 + 64 + msgpack.len());
+        lxmf_payload.extend_from_slice(&dest_arr);
+        lxmf_payload.extend_from_slice(&source_hash_bytes);
+        lxmf_payload.extend_from_slice(&signature);
+        lxmf_payload.extend_from_slice(&msgpack);
+
+        info!("LxmfNode::send_to: dest={} payload={}B", dest_hex, lxmf_payload.len());
+
         let packet = Packet {
             destination: AddressHash::new(dest_arr),
-            data: PacketDataBuffer::new_from_slice(data),
+            data: PacketDataBuffer::new_from_slice(&lxmf_payload),
             ..Default::default()
         };
 
@@ -335,7 +409,7 @@ impl LxmfNode {
 
         match outcome {
             SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => {
-                info!("LxmfNode::send_to: packet dispatched for {} ({outcome:?})", dest_hex);
+                info!("LxmfNode::send_to: dispatched ({outcome:?})");
                 Ok(())
             }
             SendPacketOutcome::DroppedMissingDestinationIdentity => {
@@ -353,22 +427,151 @@ impl LxmfNode {
         }
     }
 
-    /// Start in BLE-only mode (mode 0) — uses embedded FFI
-    fn start_ble(identity_hex: &str, address_hex: &str) -> Result<(), String> {
-        let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
-        let node = guard.as_mut().ok_or("Node not initialized")?;
+    /// Start in BLE-only mode (mode 0).
+    ///
+    /// Sets up a full rns-transport instance with BleInterface instead of TcpClient.
+    /// The Kotlin BleManager must be started separately (it owns hardware access).
+    /// Call `nativeBleConnected` / `nativeBleDisconnected` / `nativeBleReceive` from Kotlin
+    /// as BLE peers connect and send data.
+    fn start_ble(identity_hex: &str, _address_hex: &str) -> Result<(), String> {
+        use rns_transport::identity::PrivateIdentity;
+        use rns_transport::transport::TransportConfig;
+        use rns_transport::destination::DestinationName;
 
-        if node.running {
+        if Self::is_running() {
             return Err("Node already running".into());
         }
 
+        // Create or restore identity.
+        let private_identity = if identity_hex.len() == 128 {
+            PrivateIdentity::new_from_hex_string(identity_hex)
+                .map_err(|e| format!("Invalid identity hex: {:?}", e))?
+        } else {
+            info!("LxmfNode BLE: generating new identity");
+            PrivateIdentity::new_from_rand(rand_core::OsRng)
+        };
+
+        let id_hex = private_identity.to_hex_string();
+        let id_bytes = private_identity.to_private_key_bytes().to_vec();
+
+        let events = {
+            let guard = Self::global().lock().map_err(|e| e.to_string())?;
+            let node = guard.as_ref().ok_or("Node not initialized")?;
+            Arc::clone(&node.events)
+        };
+
+        let rt = get_runtime();
+
+        let (transport_arc, my_dest, mut data_rx, announce_rx, addr_hex) =
+            rt.block_on(async move {
+                let config = TransportConfig::new("lxmf-ble", &private_identity, true);
+                let mut transport = Transport::new(config);
+
+                // Register BLE interface — Kotlin feeds bytes into BleInterface via JNI.
+                {
+                    let iface_mgr = transport.iface_manager();
+                    let mut mgr = iface_mgr.lock().await;
+                    mgr.spawn(BleInterface::new(), BleInterface::spawn);
+                }
+
+                // Register LXMF delivery destination.
+                let dest_name = DestinationName::new("lxmf", "delivery");
+                let my_dest = transport.add_destination(private_identity.clone(), dest_name).await;
+
+                let addr_hex = {
+                    let d = my_dest.lock().await;
+                    hex::encode(d.desc.address_hash.as_slice())
+                };
+
+                // Brief pause to let BleInterface start its poll loop.
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+                // Send initial announce (broadcast to any connected BLE peers).
+                info!("LxmfNode BLE: sending announce as {}", addr_hex);
+                transport.send_announce(&my_dest, Some(b"lxmf-mobile")).await;
+
+                let data_rx = transport.received_data_events();
+                let announce_rx = transport.recv_announces().await;
+                let arc = Arc::new(tokio::sync::Mutex::new(transport));
+                (arc, my_dest, data_rx, announce_rx, addr_hex)
+            });
+
+        info!("LxmfNode BLE: LXMF delivery address = {}", addr_hex);
+
+        // Push status event.
+        if let Ok(mut eq) = events.lock() {
+            eq.push_back(LxmfEvent::StatusChanged { running: true, lifecycle: 0 });
+        }
+
+        // Spawn announce receiver.
+        let events_ann = Arc::clone(&events);
+        let mut announce_rx = announce_rx;
+        rt.spawn(async move {
+            loop {
+                match announce_rx.recv().await {
+                    Ok(event) => {
+                        let dest = event.destination.lock().await;
+                        let hash_bytes = dest.desc.address_hash;
+                        let mut dh = [0u8; 16];
+                        dh.copy_from_slice(hash_bytes.as_slice());
+                        let app_data = event.app_data.as_slice().to_vec();
+                        info!("LxmfNode BLE: announce from {} ({} hops)", hex::encode(&dh), event.hops);
+                        if let Ok(mut eq) = events_ann.lock() {
+                            eq.push_back(LxmfEvent::AnnounceReceived {
+                                dest_hash: dh,
+                                app_data,
+                                hops: event.hops,
+                            });
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("LxmfNode BLE: lagged {} announce events", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Spawn data receiver.
+        let events_data = Arc::clone(&events);
+        rt.spawn(async move {
+            loop {
+                match data_rx.recv().await {
+                    Ok(received) => {
+                        let mut src = [0u8; 16];
+                        src.copy_from_slice(received.destination.as_slice());
+                        let data = received.data.as_slice().to_vec();
+                        info!("LxmfNode BLE: received {} bytes", data.len());
+                        if let Ok(mut eq) = events_data.lock() {
+                            eq.push_back(LxmfEvent::MessageReceived {
+                                source: src,
+                                content: data,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            });
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("LxmfNode BLE: lagged {} data events", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Update node state.
+        let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
+        let node = guard.as_mut().ok_or("Node not initialized")?;
         node.running = true;
         node.mode = 0;
-        node.identity_hex = identity_hex.to_string();
-        node.address_hex = address_hex.to_string();
-        node.beacon_mgr.start_announce_schedule();
+        node.identity_hex = id_hex;
+        node.address_hex = addr_hex;
+        node.identity_bytes = Some(id_bytes);
+        node.transport = Some(transport_arc);
 
-        info!("LxmfNode: BLE mode started");
+        info!("LxmfNode: BLE transport started");
         Ok(())
     }
 
@@ -414,6 +617,7 @@ impl LxmfNode {
             "inboundAccepted": 0,
             "announcesReceived": 0,
             "lxmfMessagesReceived": 0,
+            "blePeerCount": crate::ble_iface::ble_peer_count() as u32,
         }).to_string();
 
         Ok(json)
@@ -467,4 +671,57 @@ impl LxmfNode {
     pub fn abi_version() -> u32 {
         2 // v2 = rns-transport based
     }
+}
+
+/// Encode LXMF msgpack payload: fixarray(4) [timestamp:f64, title:bin, content:bin, fields:fixmap{}]
+fn encode_lxmf_msgpack(timestamp: f64, title: &[u8], content: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 9 + 2 + title.len() + 2 + content.len() + 1);
+
+    // fixarray with 4 elements: 0x94
+    buf.push(0x94);
+
+    // timestamp as float64 (0xcb)
+    buf.push(0xcb);
+    buf.extend_from_slice(&timestamp.to_bits().to_be_bytes());
+
+    // title as bin8
+    buf.push(0xc4);
+    buf.push(title.len() as u8);
+    buf.extend_from_slice(title);
+
+    // content as bin8 (or bin16 if > 255 bytes)
+    if content.len() <= 255 {
+        buf.push(0xc4);
+        buf.push(content.len() as u8);
+    } else {
+        buf.push(0xc5);
+        buf.push((content.len() >> 8) as u8);
+        buf.push((content.len() & 0xff) as u8);
+    }
+    buf.extend_from_slice(content);
+
+    // fields: fixmap with 0 entries (0x80)
+    buf.push(0x80);
+
+    buf
+}
+
+/// Parse a JSON interfaces array: `[{"host":"...","port":1234}, ...]`
+fn parse_interfaces_json(json: &str) -> Result<Vec<(String, u16)>, String> {
+    let arr: Vec<serde_json::Value> = serde_json::from_str(json)
+        .map_err(|e| format!("Invalid interfaces JSON: {}", e))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let host = v["host"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("Interface {}: missing or empty \"host\"", i))?
+            .to_string();
+        let port = v["port"]
+            .as_u64()
+            .filter(|&p| p > 0 && p <= 65535)
+            .ok_or_else(|| format!("Interface {}: invalid \"port\"", i))? as u16;
+        out.push((host, port));
+    }
+    Ok(out)
 }

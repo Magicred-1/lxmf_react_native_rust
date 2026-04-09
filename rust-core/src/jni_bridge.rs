@@ -1,12 +1,13 @@
 //! JNI bridge for Android — maps Kotlin native method declarations to LxmfNode API
 
 use jni::JNIEnv;
-use jni::objects::{JClass, JString};
+use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jint, jlong, jboolean, jshort, jstring};
 use log::error;
 use serde_json;
 
 use crate::node::LxmfNode;
+use crate::ble_iface;
 
 const JNI_TRUE: jboolean = 1;
 const JNI_FALSE: jboolean = 0;
@@ -50,8 +51,8 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeStart(
     mode: jint,
     announce_interval_ms: jlong,
     ble_mtu_hint: jshort,
-    tcp_host: JString,
-    tcp_port: jshort,
+    tcp_interfaces_json: JString,
+    display_name: JString,
 ) -> jint {
     let id_str: String = match env.get_string(&identity_hex) {
         Ok(s) => s.into(),
@@ -62,13 +63,19 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeStart(
         Err(e) => { throw_err(&mut env, &format!("bad address: {}", e)); return -1; }
     };
 
-    let host: Option<String> = if tcp_host.is_null() {
-        None
+    let interfaces_json: String = if tcp_interfaces_json.is_null() {
+        "[]".to_string()
     } else {
-        env.get_string(&tcp_host).ok().map(|s| s.into())
+        env.get_string(&tcp_interfaces_json).ok().map(|s| s.into()).unwrap_or_else(|| "[]".to_string())
     };
 
-    error!("LxmfModule: starting node mode={} host={:?} port={}", mode, host, tcp_port);
+    let display_name_str: String = if display_name.is_null() {
+        String::new()
+    } else {
+        env.get_string(&display_name).ok().map(|s| s.into()).unwrap_or_default()
+    };
+
+    error!("LxmfModule: starting node mode={} interfaces={} name={}", mode, interfaces_json, display_name_str);
 
     match LxmfNode::start(
         &id_str,
@@ -76,8 +83,8 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeStart(
         mode as u32,
         announce_interval_ms as u64,
         ble_mtu_hint as u16,
-        host.as_deref(),
-        tcp_port as u16,
+        &interfaces_json,
+        &display_name_str,
     ) {
         Ok(()) => {
             error!("LxmfModule: node started successfully");
@@ -285,4 +292,107 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeAbiVersion(
     _class: JClass,
 ) -> jint {
     LxmfNode::abi_version() as jint
+}
+
+// --- BLE Interface ---
+//
+// These JNI methods are called by the Kotlin BleManager, which owns all BLE hardware access.
+// They push bytes into / pull bytes from the static queues that BleInterface polls.
+
+/// Helper: copies a JByteArray into a Rust Vec<u8>.
+fn jbytes_to_vec(env: &mut JNIEnv, arr: &JByteArray) -> Result<Vec<u8>, jni::errors::Error> {
+    let len = env.get_array_length(arr)? as usize;
+    let mut buf = vec![0i8; len];
+    env.get_byte_array_region(arr, 0, &mut buf)?;
+    Ok(buf.iter().map(|&b| b as u8).collect())
+}
+
+/// Helper: copies the first 6 bytes of a JByteArray into a [u8; 6] MAC address.
+fn jbytes_to_mac(env: &mut JNIEnv, arr: &JByteArray) -> Option<[u8; 6]> {
+    let bytes = jbytes_to_vec(env, arr).ok()?;
+    if bytes.len() < 6 { return None; }
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&bytes[..6]);
+    Some(mac)
+}
+
+/// Called by Kotlin BleManager when a BLE characteristic notification arrives.
+///
+/// `peer_addr` — 6-byte Bluetooth MAC of the sending device.
+/// `data`       — raw bytes from the characteristic value (one BLE segment).
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBleReceive(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_addr: JByteArray,
+    data: JByteArray,
+) {
+    let mac = match jbytes_to_mac(&mut env, &peer_addr) {
+        Some(m) => m,
+        None => { error!("nativeBleReceive: peer_addr must be 6 bytes"); return; }
+    };
+    let bytes = match jbytes_to_vec(&mut env, &data) {
+        Ok(b) => b,
+        Err(e) => { error!("nativeBleReceive: failed to read data: {}", e); return; }
+    };
+    ble_iface::on_ble_rx(mac, bytes);
+}
+
+/// Called by Kotlin BleManager to dequeue the next frame it should write to a peer characteristic.
+///
+/// Returns a byte array: `[6-byte peer MAC][payload...]`, or `null` when nothing is queued.
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBlePollTx(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    match ble_iface::next_ble_tx() {
+        None => std::ptr::null_mut(),
+        Some(frame) => {
+            // Encode as JSON: {"peer": "aabbccddeeff", "data": "<base64>"}
+            use base64::Engine as _;
+            let peer_hex = hex::encode(frame.peer_addr);
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&frame.data);
+            let json = format!(r#"{{"peer":"{}","data":"{}"}}"#, peer_hex, data_b64);
+            match env.new_string(&json) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+    }
+}
+
+/// Called by Kotlin BleManager when a GATT connection to a peer is established.
+///
+/// `peer_addr` — 6-byte Bluetooth MAC of the connected peer.
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBleConnected(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_addr: JByteArray,
+) {
+    if let Some(mac) = jbytes_to_mac(&mut env, &peer_addr) {
+        ble_iface::on_ble_connected(mac);
+    }
+}
+
+/// Called by Kotlin BleManager when a GATT connection to a peer is lost.
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBleDisconnected(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_addr: JByteArray,
+) {
+    if let Some(mac) = jbytes_to_mac(&mut env, &peer_addr) {
+        ble_iface::on_ble_disconnected(mac);
+    }
+}
+
+/// Returns the number of currently connected BLE peers.
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBlePeerCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    ble_iface::ble_peer_count() as jint
 }
