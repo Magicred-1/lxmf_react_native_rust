@@ -13,10 +13,13 @@ config.watchFolders = [
   path.resolve(projectRoot, '../expo-module'),
 ];
 
-// Blacklist huge directories
+// Blacklist huge directories and duplicate react-native copies
 const blockList = [
   /node_modules\/react-native\/ReactAndroid/,
   /node_modules\/react-native\/ReactApple/,
+  // Prevent expo-module's local react-native from shadowing the app's copy
+  /expo-module\/node_modules\/react-native\//,
+  /expo-module\/node_modules\/react\//,
 ];
 
 config.resolver.blockList = blockList;

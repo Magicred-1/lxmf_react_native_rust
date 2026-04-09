@@ -79,6 +79,11 @@ pub struct LxmfNode {
     identity_bytes: Option<Vec<u8>>,
     /// Reticulum transport handle (mode 3 only)
     transport: Option<Arc<tokio::sync::Mutex<Transport>>>,
+    /// Runtime counters
+    pub outbound_sent: u64,
+    pub inbound_accepted: u64,
+    pub announces_received: u64,
+    pub messages_received: u64,
 }
 
 // Access through Mutex
@@ -91,6 +96,10 @@ impl LxmfNode {
 
     /// Initialize — create the node shell. Does not start networking yet.
     pub fn init(db_path: Option<&str>) -> Result<(), String> {
+        // Install the log bridge so Rust info!/warn!/error! logs flow to the
+        // native event queue and appear in the UI's Debug Logs section.
+        crate::log_bridge::init_logger(log::LevelFilter::Debug);
+
         let store = db_path.map(|p| {
             MessageStore::open(p).map_err(|e| format!("SQLite open failed: {e}"))
         }).transpose()?;
@@ -105,6 +114,10 @@ impl LxmfNode {
             mode: 0,
             identity_bytes: None,
             transport: None,
+            outbound_sent: 0,
+            inbound_accepted: 0,
+            announces_received: 0,
+            messages_received: 0,
         };
 
         // Clear stale BLE peer list from any previous session in this process
@@ -613,10 +626,10 @@ impl LxmfNode {
             "lifecycle": if node.running { 3 } else { 0 },
             "epoch": 0,
             "pendingOutbound": 0,
-            "outboundSent": 0,
-            "inboundAccepted": 0,
-            "announcesReceived": 0,
-            "lxmfMessagesReceived": 0,
+            "outboundSent": node.outbound_sent,
+            "inboundAccepted": node.inbound_accepted,
+            "announcesReceived": node.announces_received,
+            "lxmfMessagesReceived": node.messages_received,
             "blePeerCount": crate::ble_iface::ble_peer_count() as u32,
         }).to_string();
 
@@ -649,6 +662,16 @@ impl LxmfNode {
         }
 
         events.extend(node.beacon_mgr.drain_events());
+
+        // Update counters based on drained events
+        for ev in &events {
+            match ev {
+                LxmfEvent::AnnounceReceived { .. } => node.announces_received += 1,
+                LxmfEvent::MessageReceived { .. } => node.messages_received += 1,
+                _ => {}
+            }
+        }
+
         events
     }
 

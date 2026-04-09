@@ -1,6 +1,6 @@
-import { NativeModule, requireOptionalNativeModule } from 'expo-modules-core';
+import { requireOptionalNativeModule } from 'expo-modules-core';
 
-export interface NativeModuleType extends NativeModule {
+export type NativeModuleType = {
   // Lifecycle
   init(dbPath?: string | null): boolean;
   start(

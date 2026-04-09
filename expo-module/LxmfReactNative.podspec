@@ -14,8 +14,8 @@ Pod::Spec.new do |s|
   s.source_files   = 'ios/**/*.swift'
   s.public_header_files = 'ios/**/*.h'
 
-  # Link the Rust static library
-  s.vendored_libraries = '../../rust-core/target/release/liblxmf_rn.a'
+  # Link the Rust static library (XCFramework built by scripts/build-rust-ios.sh)
+  s.vendored_frameworks = 'ios/RustCore/liblxmf_rn.xcframework'
   s.libraries      = 'c++'
 
   s.dependency 'ExpoModulesCore'
