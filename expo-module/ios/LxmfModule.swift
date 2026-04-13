@@ -121,6 +121,20 @@ func lxmf_ble_disconnected(
 @_silgen_name("lxmf_ble_peer_count")
 func lxmf_ble_peer_count() -> Int32
 
+// --- NUS Interface FFI (RNode BLE via Nordic UART Service) ---
+
+@_silgen_name("lxmf_nus_receive")
+func lxmf_nus_receive(
+    _ data: UnsafePointer<UInt8>?,
+    _ dataLen: Int
+) -> Int32
+
+@_silgen_name("lxmf_nus_poll_tx")
+func lxmf_nus_poll_tx(
+    _ outData: UnsafeMutablePointer<UInt8>?,
+    _ outCapacity: Int
+) -> Int32
+
 
 public class LxmfModule: Module {
     // Shared JSON buffer for FFI calls (64KB)
@@ -350,8 +364,7 @@ public class LxmfModule: Module {
     }
 
     private func drainOutgoing() {
-        // Poll Rust for outbound BLE frames and send to peers.
-        // Max 8 frames per 20ms tick to avoid blocking the run loop.
+        // --- Mesh BLE: poll for peer-addressed frames ---
         var peerAddr = [UInt8](repeating: 0, count: 6)
         var dataBuf = [UInt8](repeating: 0, count: 512)
 
@@ -366,6 +379,18 @@ public class LxmfModule: Module {
             let frameData = Data(dataBuf[0..<Int(len)])
             let addr = Data(peerAddr)
             bleManager.sendToPeerAddr(addr, data: frameData)
+        }
+
+        // --- NUS: poll for KISS-framed RNode data ---
+        var nusBuf = [UInt8](repeating: 0, count: 1024)
+        for _ in 0..<8 {
+            let len = nusBuf.withUnsafeMutableBufferPointer { buf in
+                lxmf_nus_poll_tx(buf.baseAddress, buf.count)
+            }
+            guard len > 0 else { break }
+
+            let kissData = Data(nusBuf[0..<Int(len)])
+            bleManager.sendToNus(kissData)
         }
     }
 

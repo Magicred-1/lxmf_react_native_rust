@@ -1,20 +1,25 @@
 import Foundation
 import CoreBluetooth
 
-/// Dual-role BLE manager for phone-to-phone Reticulum mesh
+/// Dual-role BLE manager for Reticulum mesh networking
 ///
-/// - Peripheral role: advertises mesh service, accepts connections from other phones
-/// - Central role: scans for and connects to mesh peers
+/// Handles two types of BLE connections:
+///   1. Phone-to-phone mesh: custom GATT service, HDLC+segmentation via ble_iface.rs
+///   2. RNode (Heltec V3): Nordic UART Service (NUS), KISS framing via nus_iface.rs
 ///
 /// BLE data flows:
-///   Inbound:  peer writes to RX characteristic → lxmf_ble_receive → Rust BleInterface
-///   Outbound: Rust BleInterface → lxmf_ble_poll_tx → TX characteristic notifications
+///   Mesh:  peer writes → lxmf_ble_receive → Rust BleInterface (HDLC)
+///   RNode: NUS notify  → lxmf_nus_receive → Rust NusInterface (KISS)
 class BLEManager: NSObject {
-    // UUIDs must match ble_iface.rs constants exactly
+    // Phone-to-phone mesh UUIDs (must match ble_iface.rs)
     static let meshServiceUUID = CBUUID(string: "5f3bafcd-2bb7-4de0-9c6f-2c5f88b6b8f2")
     static let rxCharUUID      = CBUUID(string: "3b28e4f6-5a30-4a5f-b700-68bb74d1b036")
     static let txCharUUID      = CBUUID(string: "8b6ded1a-ea65-4a1e-a1f0-5cf69d5dc2ad")
-    static let rnodeServiceUUID = CBUUID(string: "0000181b-0000-1000-8000-00805f9b34fb")
+
+    // RNode NUS UUIDs (Nordic UART Service — must match nus_iface.rs)
+    static let nusServiceUUID  = CBUUID(string: "6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+    static let nusTxCharUUID   = CBUUID(string: "6e400002-b5a3-f393-e0a9-e50e24dcca9e")  // write TO RNode
+    static let nusRxCharUUID   = CBUUID(string: "6e400003-b5a3-f393-e0a9-e50e24dcca9e")  // notify FROM RNode
 
     // Central (scanner/client)
     private var centralManager: CBCentralManager!
@@ -32,6 +37,10 @@ class BLEManager: NSObject {
     // so lxmf_ble_poll_tx frames can be routed to the correct peer.
     private var addrToPeripheralUUID: [Data: UUID] = [:]
     private var addrToCentral: [Data: CBCentral] = [:]
+
+    // RNode NUS connections — separate from mesh peers
+    private var nusPeripherals: [UUID: CBPeripheral] = [:]
+    private var nusTxChars: [UUID: CBCharacteristic] = [:]  // write TO RNode
 
     private var isRunning = false
 
@@ -65,10 +74,15 @@ class BLEManager: NSObject {
         for (_, peripheral) in connectedPeripherals {
             centralManager?.cancelPeripheralConnection(peripheral)
         }
+        for (_, peripheral) in nusPeripherals {
+            centralManager?.cancelPeripheralConnection(peripheral)
+        }
         connectedPeripherals.removeAll()
         txCharacteristics.removeAll()
         addrToPeripheralUUID.removeAll()
         addrToCentral.removeAll()
+        nusPeripherals.removeAll()
+        nusTxChars.removeAll()
 
         peripheralManager?.stopAdvertising()
         peripheralManager?.removeAllServices()
@@ -115,6 +129,35 @@ class BLEManager: NSObject {
            let char = txCharacteristics[peripheralUUID] {
             peripheral.writeValue(data, for: char, type: .withoutResponse)
         }
+    }
+
+    /// Write KISS-framed data to all connected RNodes via NUS TX characteristic.
+    /// Called by drainNusOutgoing() in LxmfModule.
+    func sendToNus(_ data: Data) {
+        for (uuid, char) in nusTxChars {
+            if let peripheral = nusPeripherals[uuid] {
+                // Chunk data to fit NUS MTU. CoreBluetooth negotiates MTU
+                // automatically; maximumWriteValueLength gives the usable size.
+                let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
+                if data.count <= mtu {
+                    peripheral.writeValue(data, for: char, type: .withoutResponse)
+                } else {
+                    // Chunk into MTU-sized writes
+                    var offset = 0
+                    while offset < data.count {
+                        let end = min(offset + mtu, data.count)
+                        let chunk = data[offset..<end]
+                        peripheral.writeValue(chunk, for: char, type: .withoutResponse)
+                        offset = end
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if any RNode (NUS) peripherals are connected.
+    var hasNusConnection: Bool {
+        return !nusPeripherals.isEmpty
     }
 
     /// Derive a 6-byte pseudo-MAC from a CoreBluetooth UUID.
@@ -170,7 +213,7 @@ class BLEManager: NSObject {
 
     private func startScanning() {
         centralManager.scanForPeripherals(
-            withServices: [BLEManager.meshServiceUUID, BLEManager.rnodeServiceUUID],
+            withServices: [BLEManager.meshServiceUUID, BLEManager.nusServiceUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
     }
@@ -195,26 +238,32 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        // Register peer with Rust
-        let addr = BLEManager.uuidToAddr(peripheral.identifier)
-        addrToPeripheralUUID[addr] = peripheral.identifier
-        addr.withUnsafeBytes { ptr in
-            _ = lxmf_ble_connected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
-        }
-
-        peripheral.discoverServices([BLEManager.meshServiceUUID, BLEManager.rnodeServiceUUID])
+        // Don't register with Rust yet — wait until service discovery tells us
+        // whether this is a mesh peer (→ lxmf_ble_connected) or RNode (→ NUS path).
+        // Just store the peripheral and kick off service discovery.
+        connectedPeripherals[peripheral.identifier] = peripheral
+        peripheral.discoverServices([BLEManager.meshServiceUUID, BLEManager.nusServiceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        // Notify Rust of disconnection
-        let addr = BLEManager.uuidToAddr(peripheral.identifier)
-        addrToPeripheralUUID.removeValue(forKey: addr)
-        addr.withUnsafeBytes { ptr in
-            _ = lxmf_ble_disconnected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
-        }
+        let isNus = nusPeripherals[peripheral.identifier] != nil
 
+        // Always remove from connectedPeripherals (used by both mesh and NUS)
         connectedPeripherals.removeValue(forKey: peripheral.identifier)
-        txCharacteristics.removeValue(forKey: peripheral.identifier)
+
+        if isNus {
+            // RNode NUS disconnect
+            nusPeripherals.removeValue(forKey: peripheral.identifier)
+            nusTxChars.removeValue(forKey: peripheral.identifier)
+        } else {
+            // Mesh peer disconnect — notify Rust
+            let addr = BLEManager.uuidToAddr(peripheral.identifier)
+            addrToPeripheralUUID.removeValue(forKey: addr)
+            addr.withUnsafeBytes { ptr in
+                _ = lxmf_ble_disconnected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
+            }
+            txCharacteristics.removeValue(forKey: peripheral.identifier)
+        }
 
         // Auto-reconnect
         if isRunning {
@@ -242,15 +291,47 @@ extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard let services = peripheral.services else { return }
         for service in services {
-            peripheral.discoverCharacteristics(
-                [BLEManager.rxCharUUID, BLEManager.txCharUUID],
-                for: service
-            )
+            if service.uuid == BLEManager.nusServiceUUID {
+                // RNode NUS — discover NUS characteristics
+                peripheral.discoverCharacteristics(
+                    [BLEManager.nusTxCharUUID, BLEManager.nusRxCharUUID],
+                    for: service
+                )
+            } else if service.uuid == BLEManager.meshServiceUUID {
+                // Phone-to-phone mesh — discover mesh characteristics
+                peripheral.discoverCharacteristics(
+                    [BLEManager.rxCharUUID, BLEManager.txCharUUID],
+                    for: service
+                )
+            }
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard let chars = service.characteristics else { return }
+
+        if service.uuid == BLEManager.nusServiceUUID {
+            // RNode NUS characteristics
+            nusPeripherals[peripheral.identifier] = peripheral
+            for char in chars {
+                if char.uuid == BLEManager.nusTxCharUUID {
+                    // NUS TX — we write TO the RNode on this char
+                    nusTxChars[peripheral.identifier] = char
+                } else if char.uuid == BLEManager.nusRxCharUUID {
+                    // NUS RX — subscribe for notifications FROM RNode
+                    peripheral.setNotifyValue(true, for: char)
+                }
+            }
+            return
+        }
+
+        // Phone-to-phone mesh characteristics — register peer with Rust now
+        let addr = BLEManager.uuidToAddr(peripheral.identifier)
+        addrToPeripheralUUID[addr] = peripheral.identifier
+        addr.withUnsafeBytes { ptr in
+            _ = lxmf_ble_connected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
+        }
+
         for char in chars {
             if char.uuid == BLEManager.rxCharUUID {
                 // This is the peer's RX — we write to it
@@ -264,6 +345,18 @@ extension BLEManager: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard let value = characteristic.value, !value.isEmpty else { return }
+
+        if characteristic.uuid == BLEManager.nusRxCharUUID {
+            // Inbound data from RNode via NUS — push raw bytes into Rust NusInterface.
+            // KISS deframing is handled on the Rust side (stateful).
+            value.withUnsafeBytes { dataPtr in
+                _ = lxmf_nus_receive(
+                    dataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    value.count
+                )
+            }
+            return
+        }
 
         // Inbound data from a mesh peer — push into Rust BleInterface
         let addr = BLEManager.uuidToAddr(peripheral.identifier)
