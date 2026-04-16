@@ -7,6 +7,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
 
+use log::warn;
 use crate::node::{LxmfNode, DestHash};
 use crate::framing::{hdlc_encode, kiss_encode};
 
@@ -200,7 +201,10 @@ pub unsafe extern "C" fn lxmf_send(
 
     match LxmfNode::send_to(&dest_hex, body) {
         Ok(()) => 0,
-        Err(_) => -1,
+        Err(e) => {
+            warn!("lxmf_send failed: {}", e);
+            -1
+        }
     }
 }
 
@@ -349,6 +353,52 @@ pub unsafe extern "C" fn lxmf_ble_disconnected(peer_addr: *const u8) -> i32 {
 #[no_mangle]
 pub extern "C" fn lxmf_ble_peer_count() -> i32 {
     crate::ble_iface::ble_peer_count() as i32
+}
+
+// --- NUS Interface (RNode BLE via Nordic UART Service) ---
+//
+// Swift calls these for RNode connectivity. Data is KISS-framed
+// on the Rust side — Swift just passes raw NUS characteristic bytes.
+
+/// Push raw bytes received from the RNode's NUS RX characteristic.
+///
+/// `data`     — pointer to raw bytes from NUS notification.
+/// `data_len` — number of bytes.
+///
+/// The bytes may contain partial KISS frames — the Rust-side KissDeframer
+/// handles accumulation across multiple notifications.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_nus_receive(
+    data: *const u8,
+    data_len: usize,
+) -> i32 {
+    if data.is_null() { return STATUS_ERR; }
+    if data_len == 0 || data_len > 4096 { return STATUS_ERR; }
+    let bytes = slice::from_raw_parts(data, data_len).to_vec();
+    crate::nus_iface::on_nus_rx(bytes);
+    STATUS_OK
+}
+
+/// Dequeue the next KISS-framed bytes to write to the RNode's NUS TX char.
+///
+/// `out_data`     — pointer to output buffer.
+/// `out_capacity` — size of output buffer.
+///
+/// Returns: positive = bytes written, 0 = nothing queued, negative = error.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_nus_poll_tx(
+    out_data: *mut u8,
+    out_capacity: usize,
+) -> i32 {
+    if out_data.is_null() { return STATUS_ERR; }
+    match crate::nus_iface::next_nus_tx() {
+        Some(frame) => {
+            if frame.len() > out_capacity { return STATUS_ERR; }
+            std::ptr::copy_nonoverlapping(frame.as_ptr(), out_data, frame.len());
+            frame.len() as i32
+        }
+        None => 0,
+    }
 }
 
 // --- Internal ---

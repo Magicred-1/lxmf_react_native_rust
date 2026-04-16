@@ -15,6 +15,7 @@ use serde_json;
 
 use crate::beacon::BeaconManager;
 use crate::ble_iface::BleInterface;
+use crate::nus_iface::NusInterface;
 use crate::store::MessageStore;
 
 use rns_transport::transport::Transport;
@@ -480,11 +481,13 @@ impl LxmfNode {
                 let config = TransportConfig::new("lxmf-ble", &private_identity, true);
                 let mut transport = Transport::new(config);
 
-                // Register BLE interface — Kotlin feeds bytes into BleInterface via JNI.
+                // Register BLE interface — phone-to-phone mesh (HDLC + segmentation).
+                // Register NUS interface — RNode BLE (KISS framing).
                 {
                     let iface_mgr = transport.iface_manager();
                     let mut mgr = iface_mgr.lock().await;
                     mgr.spawn(BleInterface::new(), BleInterface::spawn);
+                    mgr.spawn(NusInterface::new(), NusInterface::spawn);
                 }
 
                 // Register LXMF delivery destination.

@@ -45,3 +45,7 @@ logcat.txt
 
 # Generated files
 rust-core/src/api_probe.rs
+
+# Build artifacts
+expo-module/build/
+expo-module/ios/RustCore/
