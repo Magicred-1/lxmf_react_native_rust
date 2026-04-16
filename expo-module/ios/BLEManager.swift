@@ -42,7 +42,29 @@ class BLEManager: NSObject {
     private var nusPeripherals: [UUID: CBPeripheral] = [:]
     private var nusTxChars: [UUID: CBCharacteristic] = [:]  // write TO RNode
 
+    // Persisted set of peripheral UUIDs that have successfully completed
+    // characteristic discovery (i.e. OS-level pairing succeeded).
+    // Survives app restarts so we only auto-connect to known-good devices.
+    private var bondedPeripherals: Set<UUID> = []
+
+    // RNode peripherals discovered during scan but not yet paired via iOS Settings.
+    // Exposed to the UI so it can prompt the user to pair in Settings first.
+    private(set) var discoveredUnpairedRNodes: [UUID: CBPeripheral] = [:]
+
     private var isRunning = false
+
+    private static let bondedKey = "lxmf.ble.bondedPeripheralUUIDs"
+
+    private func loadBondedPeripherals() {
+        if let uuids = UserDefaults.standard.array(forKey: Self.bondedKey) as? [String] {
+            bondedPeripherals = Set(uuids.compactMap { UUID(uuidString: $0) })
+        }
+    }
+
+    private func saveBondedPeripherals() {
+        let uuids = bondedPeripherals.map { $0.uuidString }
+        UserDefaults.standard.set(uuids, forKey: Self.bondedKey)
+    }
 
     override init() {
         super.init()
@@ -51,6 +73,8 @@ class BLEManager: NSObject {
     func start() {
         guard !isRunning else { return }
         isRunning = true
+        loadBondedPeripherals()
+        discoveredUnpairedRNodes.removeAll()
 
         // Use restoration identifiers for background BLE
         centralManager = CBCentralManager(
@@ -83,6 +107,8 @@ class BLEManager: NSObject {
         addrToCentral.removeAll()
         nusPeripherals.removeAll()
         nusTxChars.removeAll()
+        discoveredUnpairedRNodes.removeAll()
+        // Don't clear bondedPeripherals — they persist across sessions
 
         peripheralManager?.stopAdvertising()
         peripheralManager?.removeAllServices()
@@ -232,6 +258,18 @@ extension BLEManager: CBCentralManagerDelegate {
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         guard connectedPeripherals[peripheral.identifier] == nil else { return }
 
+        // Check if this is an RNode (NUS service) that we haven't paired with yet.
+        // If so, don't auto-connect — the user needs to pair in iOS Settings first.
+        let advertisedServices = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+        let isNus = advertisedServices.contains(BLEManager.nusServiceUUID)
+
+        if isNus && !bondedPeripherals.contains(peripheral.identifier) {
+            // Track as discovered-but-unpaired so UI can prompt user
+            discoveredUnpairedRNodes[peripheral.identifier] = peripheral
+            return
+        }
+
+        // Bonded RNode or mesh peer — connect normally
         connectedPeripherals[peripheral.identifier] = peripheral
         peripheral.delegate = self
         central.connect(peripheral, options: nil)
@@ -240,9 +278,19 @@ extension BLEManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         // Don't register with Rust yet — wait until service discovery tells us
         // whether this is a mesh peer (→ lxmf_ble_connected) or RNode (→ NUS path).
-        // Just store the peripheral and kick off service discovery.
         connectedPeripherals[peripheral.identifier] = peripheral
         peripheral.discoverServices([BLEManager.meshServiceUUID, BLEManager.nusServiceUUID])
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        connectedPeripherals.removeValue(forKey: peripheral.identifier)
+        // Retry after short delay for bonded devices
+        if isRunning && bondedPeripherals.contains(peripheral.identifier) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self = self, self.isRunning else { return }
+                central.connect(peripheral, options: nil)
+            }
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
@@ -265,9 +313,9 @@ extension BLEManager: CBCentralManagerDelegate {
             txCharacteristics.removeValue(forKey: peripheral.identifier)
         }
 
-        // Auto-reconnect
-        if isRunning {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+        // Auto-reconnect bonded devices only
+        if isRunning && bondedPeripherals.contains(peripheral.identifier) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 guard let self = self, self.isRunning else { return }
                 central.connect(peripheral, options: nil)
             }
@@ -311,7 +359,10 @@ extension BLEManager: CBPeripheralDelegate {
         guard let chars = service.characteristics else { return }
 
         if service.uuid == BLEManager.nusServiceUUID {
-            // RNode NUS characteristics
+            // RNode NUS characteristics — mark as bonded (pairing succeeded)
+            bondedPeripherals.insert(peripheral.identifier)
+            saveBondedPeripherals()
+            discoveredUnpairedRNodes.removeValue(forKey: peripheral.identifier)
             nusPeripherals[peripheral.identifier] = peripheral
             for char in chars {
                 if char.uuid == BLEManager.nusTxCharUUID {
@@ -325,7 +376,9 @@ extension BLEManager: CBPeripheralDelegate {
             return
         }
 
-        // Phone-to-phone mesh characteristics — register peer with Rust now
+        // Phone-to-phone mesh characteristics — mark as bonded and register with Rust
+        bondedPeripherals.insert(peripheral.identifier)
+        saveBondedPeripherals()
         let addr = BLEManager.uuidToAddr(peripheral.identifier)
         addrToPeripheralUUID[addr] = peripheral.identifier
         addr.withUnsafeBytes { ptr in

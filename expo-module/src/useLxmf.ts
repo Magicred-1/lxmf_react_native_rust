@@ -311,6 +311,10 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     LxmfModule.stopBLE();
   }, []);
 
+  const bleUnpairedRNodeCount = useCallback(() => {
+    return LxmfModule.bleUnpairedRNodeCount();
+  }, []);
+
   return {
     // State
     status,
@@ -331,5 +335,6 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     setLogLevel,
     startBLE,
     stopBLE,
+    bleUnpairedRNodeCount,
   };
 }
