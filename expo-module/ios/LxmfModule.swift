@@ -296,6 +296,10 @@ public class LxmfModule: Module {
         Function("blePeerCount") { () -> Int in
             return Int(lxmf_ble_peer_count())
         }
+
+        Function("bleUnpairedRNodeCount") { () -> Int in
+            return self.bleManager.discoveredUnpairedRNodes.count
+        }
     }
 
     // MARK: - Polling

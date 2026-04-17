@@ -32,6 +32,7 @@ export type NativeModuleType = {
   startBLE(): boolean;
   stopBLE(): boolean;
   blePeerCount(): number;
+  bleUnpairedRNodeCount(): number;
 }
 
 const MISSING_NATIVE_MESSAGE =
@@ -60,6 +61,7 @@ const missingNativeShim: NativeModuleType = {
   startBLE: () => throwMissingNative(),
   stopBLE: () => throwMissingNative(),
   blePeerCount: () => throwMissingNative(),
+  bleUnpairedRNodeCount: () => throwMissingNative(),
 } as NativeModuleType;
 
 export const LxmfModule = LxmfModuleNative ?? missingNativeShim;

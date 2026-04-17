@@ -144,8 +144,8 @@ const SEED = 'new';
 
 export default function HomeScreen() {
   // Transport state
-  const [tcpHost, setTcpHost] = useState('127.0.0.1');
-  const [tcpPort, setTcpPort] = useState('4242');
+  const [tcpHost, setTcpHost] = useState('192.168.1.135');
+  const [tcpPort, setTcpPort] = useState('4243');
   const [bleActive, setBleActive] = useState(false);
   const [tcpActive, setTcpActive] = useState(false);
   const [transportMsg, setTransportMsg] = useState('');
@@ -155,9 +155,11 @@ export default function HomeScreen() {
   const [msgText, setMsgText] = useState('Hello from LXMF');
   const [sendResult, setSendResult] = useState('');
 
+  const [unpairedRNodes, setUnpairedRNodes] = useState(0);
+
   const {
     isNativeAvailable, isRunning, status, error, events, beacons,
-    start, stop, send, getStatus, startBLE, stopBLE,
+    start, stop, send, getStatus, startBLE, stopBLE, bleUnpairedRNodeCount,
   } = useLxmf({ identityHex: SEED, lxmfAddressHex: SEED, logLevel: 3 });
 
   // ── Derived ───────────────────────────────────────────────────────────────
@@ -218,7 +220,17 @@ export default function HomeScreen() {
   const onStopBle = useCallback(() => {
     stopBLE();
     setBleActive(false);
+    setUnpairedRNodes(0);
   }, [stopBLE]);
+
+  // Poll for unpaired RNodes while BLE is active
+  useEffect(() => {
+    if (!bleActive) return;
+    const id = setInterval(() => {
+      try { setUnpairedRNodes(bleUnpairedRNodeCount()); } catch {}
+    }, 2000);
+    return () => clearInterval(id);
+  }, [bleActive, bleUnpairedRNodeCount]);
 
   const onSend = useCallback(async () => {
     const d = dest.trim().toLowerCase();
@@ -293,9 +305,14 @@ export default function HomeScreen() {
 
       {/* ── BLE Mesh ─────────────────────────────────────────────────────── */}
       <Accordion title="BLE Mesh" defaultOpen>
-        <Text style={S.hint}>BLE scan + advertise independent of TCP. Both can run together.</Text>
+        <Text style={S.hint}>Pair RNodes in iOS Settings &gt; Bluetooth first, then start BLE.</Text>
         <Row label="BLE active" value={bleActive ? 'Yes' : 'No'} />
         <Row label="BLE peers" value={String(status?.blePeerCount ?? 0)} />
+        {unpairedRNodes > 0 && (
+          <Text style={S.warn}>
+            Found {unpairedRNodes} unpaired RNode{unpairedRNodes > 1 ? 's' : ''}. Open Settings &gt; Bluetooth, pair the device, then restart BLE.
+          </Text>
+        )}
         <View style={S.btnRow}>
           <Btn label="Start BLE" onPress={onStartBle} disabled={bleActive} />
           <Btn label="Stop BLE" onPress={onStopBle} disabled={!bleActive} danger />
@@ -359,8 +376,8 @@ export default function HomeScreen() {
         {msgEvts.length === 0 ? (
           <Text style={S.muted}>No messages yet.</Text>
         ) : (
-          msgEvts.map(e => (
-            <View key={evtKey(e, 'msg-')} style={S.itemCard}>
+          msgEvts.map((e, i) => (
+            <View key={`${evtKey(e, 'msg-')}-${i}`} style={S.itemCard}>
               <Text selectable style={S.itemTitle}>{evtSummary(e)}</Text>
               {e.content ? (
                 <Text selectable style={S.itemBody}>{String(e.content)}</Text>
@@ -376,8 +393,8 @@ export default function HomeScreen() {
         {allEvts.length === 0 ? (
           <Text style={S.muted}>No events yet.</Text>
         ) : (
-          allEvts.map(e => (
-            <View key={evtKey(e, 'el-')} style={S.logRow}>
+          allEvts.map((e, i) => (
+            <View key={`${evtKey(e, 'el-')}-${i}`} style={S.logRow}>
               <Text style={S.logTag}>{e.type}</Text>
               <Text selectable style={S.logText} numberOfLines={2}>{evtSummary(e)}</Text>
               <Text style={S.logTime}>{fmtTime(e)}</Text>
@@ -391,8 +408,8 @@ export default function HomeScreen() {
         {logEvts.length === 0 ? (
           <Text style={S.muted}>No logs yet.</Text>
         ) : (
-          logEvts.map(e => (
-            <Text key={evtKey(e, 'lg-')} selectable style={S.logLine} numberOfLines={3}>
+          logEvts.map((e, i) => (
+            <Text key={`${evtKey(e, 'lg-')}-${i}`} selectable style={S.logLine} numberOfLines={3}>
               [{fmtTime(e)}] {evtSummary(e)}
             </Text>
           ))
