@@ -9,30 +9,22 @@
 node --version    # Should be v18+
 npm --version     # Should be v9+
 
-# Expo CLI
-npm install -g expo-cli
-
 # Xcode (iOS) or Android Studio (Android)
 # For physical device: just need Expo Go app
 ```
 
-### 2. Build Rust Library
+> **Contributors only:** If modifying Rust, rebuild first:
+> `cd rust-core && cargo build --release --target aarch64-linux-android`
+> Then `npm run rust:android` from `expo-module/` to copy `.so` files.
 
-```bash
-cd rust-core
-cargo build --release
-# Creates: target/release/liblxmf_rn.a (iOS) + .so (Android)
-cd ../
-```
-
-### 3. Install Dependencies
+### 2. Install Dependencies
 
 ```bash
 cd example-app
 npm install
 ```
 
-### 4. Run on Device
+### 3. Run on Device
 
 ```bash
 npm start
@@ -184,22 +176,26 @@ npm start
 ### Rust Library Not Found
 
 ```bash
-# Check if built:
-ls ../rust-core/target/release/liblxmf_rn.*
+# Check Android .so files:
+ls ../expo-module/android/src/main/jniLibs/arm64-v8a/liblxmf_rn.so
 
-# If not found, rebuild:
+# If missing, rebuild:
 cd ../rust-core
-cargo build --release
-cd ../example-app
-npx expo run:android / npx expo run:ios
+cargo build --release --target aarch64-linux-android
+cd ../expo-module
+npm run rust:android
+
+# Check iOS XCFramework:
+ls ../expo-module/ios/RustCore/liblxmf_rn.xcframework
+# If missing, build on macOS:
+npm run rust:ios
 ```
 
 ### "Failed to start LXMF node" on iOS
 
-- Go to Xcode build settings
-- Verify "Other Linker Flags" includes `-lc++`
-- Verify "Library Search Paths" includes Rust target dir
-- Rebuild: `npm start` → `i`
+- Ensure `ios/RustCore/liblxmf_rn.xcframework` is built and present
+- Run `npm run rust:ios` from `expo-module/` to build it
+- Rebuild: `npx expo run:ios`
 
 ### "System.loadLibrary failed" on Android
 
@@ -207,19 +203,16 @@ npx expo run:android / npx expo run:ios
 # Rebuild Rust for Android:
 cd ../rust-core
 cargo build --release --target aarch64-linux-android
-
-# Rebuild iOS static library:
-cargo build --release --target aarch64-apple-ios
+cd ../expo-module
+npm run rust:android
 
 # Clean gradle cache:
-cd ../expo-module/android
-rm -rf build
+cd android
 ./gradlew clean
 
 # Rebuild example:
 cd ../../example-app
-npm start
-# Press 'a'
+npx expo run:android
 ```
 
 ### No Beacons Discovered
@@ -334,9 +327,9 @@ BLE Mesh Network
 | Run on iOS simulator | `npm start` → `i` |
 | Run on Android emulator | `npm start` → `a` |
 | Run on web (UI only) | `npm start` → `w` |
-| Rebuild Rust | `cd ../rust-core && cargo build --release` |
-| Clear cache | `expo cache --purge` |
-| View logs | `expo logs` |
+| Rebuild Rust (Android) | `cd ../rust-core && cargo build --release --target aarch64-linux-android` |
+| Clear cache | `npx expo start --clear` |
+| View logs | `npx expo logs` |
 | Reload app | Press `r` in terminal |
 
 ---

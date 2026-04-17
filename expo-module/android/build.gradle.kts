@@ -31,24 +31,3 @@ dependencies {
     compileOnly(project(":expo-modules-core"))
 }
 
-// Copy Rust library
-val copyRustLibraries by tasks.registering(Copy::class) {
-    val rustLibDir = file("../../rust-core/target/aarch64-linux-android/release")
-    val rustLib = rustLibDir.resolve("liblxmf_rn.so")
-
-    doFirst {
-        if (!rustLib.exists()) {
-            throw GradleException(
-                "Missing Android Rust library at ${rustLib.absolutePath}. Build it first for target aarch64-linux-android."
-            )
-        }
-    }
-
-    from(rustLibDir)
-    include("liblxmf_rn.so")
-    into("src/main/jniLibs/arm64-v8a")
-}
-
-tasks.named("preBuild") {
-    dependsOn(copyRustLibraries)
-}

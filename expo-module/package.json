@@ -39,6 +39,7 @@
     "react-native",
     "expo"
   ],
+  "homepage": "https://anonme.sh",
   "repository": {
     "type": "git",
     "url": "https://github.com/anon0mesh/lxmf_react_native_rust.git"
@@ -65,11 +66,11 @@
   "files": [
     "build",
     "ios",
-    "android",
+    "android/build.gradle.kts",
+    "android/src/main",
     "LxmfReactNative.podspec",
     "expo-module.config.json",
     "app.plugin.js",
-    "expo-module.config.js",
     "README.md"
   ]
 }

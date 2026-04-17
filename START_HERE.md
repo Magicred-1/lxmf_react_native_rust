@@ -89,7 +89,8 @@ lxmf_react_native_rust/
 ├── expo-module/                ← Native modules + TypeScript
 │   ├── package.json           ← NPM dependencies
 │   ├── tsconfig.json          ← TypeScript config
-│   ├── expo-module.config.js  ← Expo build plugin
+│   ├── app.plugin.js          ← Expo config plugin (BLE permissions)
+│   ├── expo-module.config.json ← Expo module registration
 │   ├── LxmfReactNative.podspec ← iOS CocoaPods spec
 │   │
 │   ├── src/
@@ -102,7 +103,7 @@ lxmf_react_native_rust/
 │   │   └── BLEManager.swift   ← Dual-role BLE (partial)
 │   │
 │   └── android/
-│       ├── build.gradle.kts   ← Android build + Rust linking
+│       ├── build.gradle.kts   ← Android build config
 │       └── src/main/kotlin/
 │           └── expo/modules/lxmf/
 │               └── LxmfModule.kt ← Expo module + JNI
