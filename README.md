@@ -1,4 +1,4 @@
-# @lxmf/react-native
+# @magicred-1/react-native-lxmf
 
 LXMF mesh networking for React Native + Expo, powered by a Rust core.
 
@@ -13,7 +13,7 @@ Expo module wrapping a Rust implementation of [LXMF](https://github.com/markqvis
 ## Install
 
 ```bash
-npm install @lxmf/react-native
+npm install @magicred-1/react-native-lxmf
 ```
 
 Requires a [custom dev client](https://docs.expo.dev/develop/development-builds/introduction/) — not compatible with Expo Go.
@@ -21,7 +21,7 @@ Requires a [custom dev client](https://docs.expo.dev/develop/development-builds/
 ## Usage
 
 ```ts
-import { useLxmf, LxmfNodeMode } from '@lxmf/react-native';
+import { useLxmf, LxmfNodeMode } from '@magicred-1/react-native-lxmf';
 
 const { start, stop, send, status, beacons, events } = useLxmf({
   identityHex: 'new',
@@ -46,7 +46,7 @@ Add to `app.json` to auto-configure BLE permissions:
 ```json
 {
   "expo": {
-    "plugins": ["@lxmf/react-native"]
+    "plugins": ["@magicred-1/react-native-lxmf"]
   }
 }
 ```

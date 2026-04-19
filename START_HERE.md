@@ -47,7 +47,7 @@ npm install --save ../expo-module
 Then use in your React Native component:
 
 ```tsx
-import { useLxmf } from '@lxmf/react-native';
+import { useLxmf } from '@magicred-1/react-native-lxmf';
 
 export default function MyComponent() {
   const { start, send, status } = useLxmf();
@@ -181,7 +181,7 @@ npm start
 npm install --save /path/to/expo-module
 
 # In your component:
-import { useLxmf } from '@lxmf/react-native';
+import { useLxmf } from '@magicred-1/react-native-lxmf';
 
 const { start, send, getBeacons, status } = useLxmf({
   logLevel: 2, // info

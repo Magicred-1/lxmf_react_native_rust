@@ -1,4 +1,11 @@
-import { requireOptionalNativeModule } from 'expo-modules-core';
+// Lazy require — safe in Node.js config-plugin context (no React Native runtime)
+let requireOptionalNativeModule: (<T>(name: string) => T | null) = () => null;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  requireOptionalNativeModule = require('expo-modules-core').requireOptionalNativeModule;
+} catch {
+  // Node.js / config-plugin evaluation context — native modules not available
+}
 
 export type NativeModuleType = {
   // Lifecycle

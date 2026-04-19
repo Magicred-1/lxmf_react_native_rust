@@ -1,6 +1,6 @@
 {
-  "name": "@lxmf/react-native",
-  "version": "0.1.0",
+  "name": "@magicred-1/react-native-lxmf",
+  "version": "0.1.7",
   "description": "LXMF Reticulum mesh networking for React Native + Expo",
   "main": "build/index.js",
   "types": "build/index.d.ts",
@@ -9,6 +9,8 @@
       "types": "./build/index.d.ts",
       "default": "./build/index.js"
     },
+    "./app.plugin": "./app.plugin.js",
+    "./app.plugin.js": "./app.plugin.js",
     "./package.json": "./package.json"
   },
   "expo": {
@@ -66,7 +68,7 @@
   "files": [
     "build",
     "ios",
-    "android/build.gradle.kts",
+    "android/build.gradle",
     "android/src/main",
     "LxmfReactNative.podspec",
     "expo-module.config.json",

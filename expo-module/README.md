@@ -1,17 +1,17 @@
-# @lxmf/react-native
+# @magicred-1/react-native-lxmf
 
 LXMF Reticulum mesh networking module for React Native + Expo.
 
 ## Install
 
 ```bash
-npm install @lxmf/react-native
+npm install @magicred-1/react-native-lxmf
 ```
 
 ## Usage
 
 ```ts
-import { useLxmf, LxmfNodeMode } from '@lxmf/react-native';
+import { useLxmf, LxmfNodeMode } from '@magicred-1/react-native-lxmf';
 
 const lxmf = useLxmf({
   identityHex: 'new',

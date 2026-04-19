@@ -152,7 +152,7 @@ impl LxmfNode {
                 let interfaces = parse_interfaces_json(interfaces_json)?;
                 Self::start_reticulum(identity_hex, address_hex, &interfaces, announce_interval_ms, display_name)
             }
-            0 => Self::start_ble(identity_hex, address_hex),
+            0 => Self::start_ble(identity_hex, address_hex, display_name),
             _ => Err(format!("Unsupported mode: {}. Use 0 (BLE) or 3 (Reticulum TCP)", mode)),
         }
     }
@@ -447,7 +447,7 @@ impl LxmfNode {
     /// The Kotlin BleManager must be started separately (it owns hardware access).
     /// Call `nativeBleConnected` / `nativeBleDisconnected` / `nativeBleReceive` from Kotlin
     /// as BLE peers connect and send data.
-    fn start_ble(identity_hex: &str, _address_hex: &str) -> Result<(), String> {
+    fn start_ble(identity_hex: &str, _address_hex: &str, display_name: &str) -> Result<(), String> {
         use rns_transport::identity::PrivateIdentity;
         use rns_transport::transport::TransportConfig;
         use rns_transport::destination::DestinationName;
@@ -475,6 +475,7 @@ impl LxmfNode {
         };
 
         let rt = get_runtime();
+        let display_name = display_name.to_owned();
 
         let (transport_arc, my_dest, mut data_rx, announce_rx, addr_hex) =
             rt.block_on(async move {
@@ -504,7 +505,12 @@ impl LxmfNode {
 
                 // Send initial announce (broadcast to any connected BLE peers).
                 info!("LxmfNode BLE: sending announce as {}", addr_hex);
-                transport.send_announce(&my_dest, Some(b"lxmf-mobile")).await;
+                let ble_name: Vec<u8> = if display_name.is_empty() {
+                    b"lxmf-mobile".to_vec()
+                } else {
+                    display_name.as_bytes()[..display_name.len().min(32)].to_vec()
+                };
+                transport.send_announce(&my_dest, Some(ble_name.as_slice())).await;
 
                 let data_rx = transport.received_data_events();
                 let announce_rx = transport.recv_announces().await;
