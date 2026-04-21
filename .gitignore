@@ -48,4 +48,4 @@ rust-core/src/api_probe.rs
 
 # Build artifacts
 expo-module/build/
-expo-module/ios/RustCore/
+# expo-module/ios/RustCore/ — checked in for CI (no Rust toolchain on CI runners)
