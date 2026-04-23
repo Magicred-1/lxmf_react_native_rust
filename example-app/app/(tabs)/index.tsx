@@ -468,15 +468,32 @@ export default function HomeScreen() {
         ) : (
           msgEvts.map((e, i) => {
             const body = decodeLxmfContent(e.content);
+            const sender = String(e.source ?? '');
             return (
               <View key={`${evtKey(e, 'msg-')}-${i}`} style={S.itemCard}>
-                <Text selectable style={S.itemTitle}>
-                  From: {shortHex(String(e.source ?? '?'))}
-                </Text>
-                {body ? (
-                  <Text selectable style={S.itemBody}>{body}</Text>
-                ) : null}
-                <Text style={S.itemMeta}>{fmtTime(e)}</Text>
+                <View style={S.announceHeader}>
+                  <View style={S.announceInfo}>
+                    <Text selectable style={S.itemTitle}>
+                      From: {shortHex(sender)}
+                    </Text>
+                    {body ? <Text selectable style={S.itemBody}>{body}</Text> : null}
+                    <Text style={S.itemMeta}>{fmtTime(e)}</Text>
+                  </View>
+                  {sender ? (
+                    <View style={S.announceActions}>
+                      <Pressable
+                        style={S.copyBtn}
+                        onPress={() => copyToClipboard(sender)}>
+                        <Text style={S.copyBtnText}>⎘</Text>
+                      </Pressable>
+                      <Pressable
+                        style={S.sendToBtn}
+                        onPress={() => { setDest(sender); setSendResult(''); }}>
+                        <Text style={S.sendToBtnText}>↩ Reply</Text>
+                      </Pressable>
+                    </View>
+                  ) : null}
+                </View>
               </View>
             );
           })
