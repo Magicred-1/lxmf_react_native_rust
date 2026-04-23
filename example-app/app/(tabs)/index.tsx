@@ -54,26 +54,23 @@ function fmtTime(e: LxmfEvent): string {
     .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-/** Try to extract human-readable text from raw LXMF hex content.
- *  Wire format: dest(16) + src(16) + sig(64) + msgpack_payload = 96B header
- *  Falls back to showing byte count. */
+/** Extract message text from raw LXMF hex content.
+ *  Skips 96B header (dest+src+sig), scans for longest printable run. */
 function decodeLxmfContent(hexOrStr: string | undefined): string {
   if (!hexOrStr) return '';
   const hex = String(hexOrStr);
-  // Not hex — just show as-is
   if (!/^[0-9a-fA-F]+$/.test(hex)) return hex;
   const len = hex.length / 2;
   if (len <= 96) return `[${len}B raw]`;
   try {
     const payload = new Uint8Array(len - 96);
     for (let i = 0; i < payload.length; i++) {
-      payload[i] = parseInt(hex.slice((i + 96) * 2, (i + 96) * 2 + 2), 16);
+      payload[i] = Number.parseInt(hex.slice((i + 96) * 2, (i + 96) * 2 + 2), 16);
     }
     const decoded = new TextDecoder('utf-8', { fatal: false }).decode(payload);
-    // Strip non-printable except common whitespace
-    const printable = decoded.replace(/[^\x20-\x7E\n\r\t]/g, '').trim();
-    if (printable.length >= 3) return printable;
-    return `[${len}B binary]`;
+    const runs = decoded.match(/[\x20-\x7E\n\r\t]{4,}/g) ?? [];
+    if (runs.length === 0) return `[${len}B binary]`;
+    return runs.reduce((a, b) => a.length >= b.length ? a : b).trim();
   } catch {
     return `[${len}B]`;
   }
@@ -386,8 +383,62 @@ export default function HomeScreen() {
         </View>
       </Accordion>
 
+      {/* ── Peers / Beacons ──────────────────────────────────────────────── */}
+      <Accordion title="Peers / Beacons" badge={beacons.length} defaultOpen={false}>
+        {beacons.length === 0 ? (
+          <Text style={S.muted}>No peers yet.</Text>
+        ) : (
+          beacons.map((b, i) => (
+            <View key={`${b.destHash}-${i}`} style={S.itemCard}>
+              <Text selectable style={S.itemTitle}>{shortHex(b.destHash)}</Text>
+              <Text style={S.itemMeta}>state: {b.state} · reconnects: {b.reconnectAttempts}</Text>
+            </View>
+          ))
+        )}
+      </Accordion>
+
+      {/* ── Announces ────────────────────────────────────────────────────── */}
+      <Accordion title="Announces" badge={counts.announces} defaultOpen>
+        {announceEvts.length === 0 ? (
+          <Text style={S.muted}>No announces yet.</Text>
+        ) : (
+          announceEvts.map((e: LxmfEvent, i: number) => {
+            const hash = String(e.destHash ?? e.address ?? '');
+            const name = e.appData ? String(e.appData) : '';
+            return (
+              <View key={`${evtKey(e, 'ann-')}-${i}`} style={S.itemCard}>
+                <View style={S.announceHeader}>
+                  <View style={S.announceInfo}>
+                    {name ? <Text style={S.itemTitle}>{name}</Text> : null}
+                    <Text selectable style={S.itemBody}>{shortHex(hash)}</Text>
+                    <Text style={S.itemMeta}>{fmtTime(e)}{e.hops !== undefined ? ` · ${e.hops} hop` : ''}</Text>
+                  </View>
+                  <View style={S.announceActions}>
+                    <Pressable
+                      style={S.copyBtn}
+                      onPress={() => copyToClipboard(hash)}>
+                      <Text style={S.copyBtnText}>⎘</Text>
+                    </Pressable>
+                    <Pressable
+                      style={S.sendToBtn}
+                      onPress={() => { setDest(hash); setSendResult(''); }}>
+                      <Text style={S.sendToBtnText}>→ Send</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              </View>
+            );
+          })
+        )}
+      </Accordion>
+
       {/* ── Send Message ─────────────────────────────────────────────────── */}
       <Accordion title="Send Message" defaultOpen>
+        {dest ? (
+          <Text style={S.destFilled}>→ {shortHex(dest)}</Text>
+        ) : (
+          <Text style={S.hint}>{'Tap "→ Send" on an announce above to fill the destination.'}</Text>
+        )}
         <TextInput
           style={S.input}
           placeholder="Destination (32 hex chars)"
@@ -408,35 +459,6 @@ export default function HomeScreen() {
           <Btn label="Send" onPress={onSend} disabled={!isRunning} />
         </View>
         {sendResult ? <Text style={S.feedback}>{sendResult}</Text> : null}
-      </Accordion>
-
-      {/* ── Peers / Beacons ──────────────────────────────────────────────── */}
-      <Accordion title="Peers / Beacons" badge={beacons.length} defaultOpen={false}>
-        {beacons.length === 0 ? (
-          <Text style={S.muted}>No peers yet.</Text>
-        ) : (
-          beacons.map((b, i) => (
-            <View key={`${b.destHash}-${i}`} style={S.itemCard}>
-              <Text selectable style={S.itemTitle}>{shortHex(b.destHash)}</Text>
-              <Text style={S.itemMeta}>state: {b.state} · reconnects: {b.reconnectAttempts}</Text>
-            </View>
-          ))
-        )}
-      </Accordion>
-
-      {/* ── Announces ────────────────────────────────────────────────────── */}
-      <Accordion title="Announces" badge={counts.announces} defaultOpen={false}>
-        {announceEvts.length === 0 ? (
-          <Text style={S.muted}>No announces yet.</Text>
-        ) : (
-          announceEvts.map((e: LxmfEvent, i: number) => (
-            <View key={`${evtKey(e, 'ann-')}-${i}`} style={S.itemCard}>
-              <Text selectable style={S.itemTitle}>{evtSummary(e)}</Text>
-              {e.appData ? <Text selectable style={S.itemBody}>{String(e.appData)}</Text> : null}
-              <Text style={S.itemMeta}>{fmtTime(e)}</Text>
-            </View>
-          ))
-        )}
       </Accordion>
 
       {/* ── Messages ─────────────────────────────────────────────────────── */}
@@ -655,4 +677,23 @@ const S = StyleSheet.create({
   logText: { color: C.textMono, flex: 1, fontSize: 11, fontFamily: 'monospace' },
   logTime: { color: C.textDim, fontFamily: 'monospace', fontSize: 10 },
   logLine: { color: C.textMono, fontSize: 11, fontFamily: 'monospace' },
+
+  // Announce card layout
+  announceHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  announceInfo: { flex: 1, gap: 2 },
+  announceActions: { flexDirection: 'row', gap: 6, alignItems: 'center' },
+
+  // Send-to button on announce cards
+  sendToBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: '#0d3550',
+    borderWidth: 1,
+    borderColor: C.accentBright,
+  },
+  sendToBtnText: { color: C.accentBright, fontSize: 12, fontWeight: '600' },
+
+  // Destination pre-filled indicator
+  destFilled: { color: C.accentBright, fontSize: 12, fontFamily: 'monospace' },
 });

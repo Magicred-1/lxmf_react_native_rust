@@ -200,7 +200,7 @@ pub unsafe extern "C" fn lxmf_send(
     let body = slice::from_raw_parts(body_ptr, body_len);
 
     match LxmfNode::send_to(&dest_hex, body) {
-        Ok(()) => 0,
+        Ok(seq) => seq as i64,
         Err(e) => {
             warn!("lxmf_send failed: {}", e);
             -1

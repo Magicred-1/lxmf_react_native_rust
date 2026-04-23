@@ -60,6 +60,14 @@ fn get_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// A message queued for opportunistic delivery: stored as a pre-signed LXMF payload,
+/// retried automatically when the destination peer sends an announce.
+struct PendingSend {
+    seq: u64,
+    dest: [u8; 16],
+    lxmf_payload: Vec<u8>,
+}
+
 /// The main LXMF node — wraps either embedded FFI or full rns-transport
 pub struct LxmfNode {
     /// Event queue polled by native layer
@@ -85,6 +93,8 @@ pub struct LxmfNode {
     pub inbound_accepted: u64,
     pub announces_received: u64,
     pub messages_received: u64,
+    /// Opportunistic send queue: messages awaiting a peer announce before delivery
+    pending_sends: Arc<Mutex<Vec<PendingSend>>>,
 }
 
 // Access through Mutex
@@ -119,6 +129,7 @@ impl LxmfNode {
             inbound_accepted: 0,
             announces_received: 0,
             messages_received: 0,
+            pending_sends: Arc::new(Mutex::new(Vec::new())),
         };
 
         // Clear stale BLE peer list from any previous session in this process
@@ -260,6 +271,14 @@ impl LxmfNode {
             eq.push_back(LxmfEvent::StatusChanged { running: true, lifecycle: 3 });
         }
 
+        // Grab the pending-send queue so the announce task can flush it
+        let pending_for_ann = {
+            let guard = Self::global().lock().map_err(|e| e.to_string())?;
+            let node = guard.as_ref().ok_or("Node not initialized")?;
+            Arc::clone(&node.pending_sends)
+        };
+        let transport_for_ann = Arc::clone(&transport_arc);
+
         // Spawn announce receiver
         let events_ann = Arc::clone(&events);
         let mut announce_rx = announce_rx;
@@ -273,6 +292,34 @@ impl LxmfNode {
                         dh.copy_from_slice(hash_bytes.as_slice());
                         let app_data = event.app_data.as_slice().to_vec();
                         info!("LxmfNode: announce from {} ({} hops)", hex::encode(&dh), event.hops);
+                        drop(dest);
+
+                        // Flush any queued opportunistic sends for this peer
+                        let to_retry: Vec<(u64, Vec<u8>)> = {
+                            let mut q = pending_for_ann.lock().unwrap_or_else(|p| p.into_inner());
+                            let (matched, rest): (Vec<_>, Vec<_>) =
+                                q.drain(..).partition(|s| s.dest == dh);
+                            *q = rest;
+                            matched.into_iter().map(|s| (s.seq, s.lxmf_payload)).collect()
+                        };
+
+                        if !to_retry.is_empty() {
+                            use rns_transport::hash::AddressHash;
+                            use rns_transport::packet::{Packet, PacketDataBuffer};
+                            let transport = transport_for_ann.lock().await;
+                            for (seq, payload) in &to_retry {
+                                let mut dest_arr = [0u8; 16];
+                                dest_arr.copy_from_slice(&payload[..16]);
+                                let packet = Packet {
+                                    destination: AddressHash::new(dest_arr),
+                                    data: PacketDataBuffer::new_from_slice(payload),
+                                    ..Default::default()
+                                };
+                                let outcome = transport.send_packet_with_outcome(packet).await;
+                                info!("LxmfNode: opportunistic retry seq={} -> {:?}", seq, outcome);
+                            }
+                        }
+
                         if let Ok(mut eq) = events_ann.lock() {
                             eq.push_back(LxmfEvent::AnnounceReceived {
                                 dest_hash: dh,
@@ -391,20 +438,25 @@ impl LxmfNode {
     /// where msgpack payload = [timestamp: f64, title: bytes, content: bytes, fields: {}]
     ///
     /// The Reticulum transport then encrypts and routes the packet.
-    pub fn send_to(dest_hex: &str, content: &[u8]) -> Result<(), String> {
+    /// Returns `Ok(seq)` on dispatch or opportunistic queue, `Err` on hard failure.
+    /// `seq` is a monotonic counter starting at 0, unique per send attempt.
+    pub fn send_to(dest_hex: &str, content: &[u8]) -> Result<u64, String> {
         use rns_transport::hash::AddressHash;
         use rns_transport::identity::PrivateIdentity;
         use rns_transport::packet::{Packet, PacketDataBuffer};
         use rns_transport::transport::SendPacketOutcome;
 
-        let (transport, identity_bytes, source_hash_bytes) = {
-            let guard = Self::global().lock().map_err(|e| e.to_string())?;
-            let node = guard.as_ref().ok_or("Node not initialized")?;
+        let (transport, identity_bytes, source_hash_bytes, seq, pending_sends) = {
+            let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
+            let node = guard.as_mut().ok_or("Node not initialized")?;
             let transport = node.transport.clone().ok_or("Transport not started (mode 3 only)")?;
             let id_bytes = node.identity_bytes.clone().ok_or("No identity available")?;
             let addr_hex = node.address_hex.clone();
             let src = hex::decode(&addr_hex).map_err(|e| format!("Bad address hex: {e}"))?;
-            (transport, id_bytes, src)
+            let seq = node.outbound_sent;
+            node.outbound_sent += 1;
+            let pending = Arc::clone(&node.pending_sends);
+            (transport, id_bytes, src, seq, pending)
         };
 
         let dest_bytes = hex::decode(dest_hex)
@@ -419,19 +471,15 @@ impl LxmfNode {
         let mut dest_arr = [0u8; 16];
         dest_arr.copy_from_slice(&dest_bytes);
 
-        // Rebuild identity for signing
         let private_identity = PrivateIdentity::from_private_key_bytes(&identity_bytes)
             .map_err(|e| format!("Failed to restore identity: {:?}", e))?;
 
-        // Encode LXMF msgpack payload: [timestamp: f64, title: bin, content: bin, fields: fixmap{}]
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
         let msgpack = encode_lxmf_msgpack(timestamp, b"", content);
 
-        // Build: dest_hash(16) + source_hash(16) + signature(64) + msgpack
-        // Signature covers: dest_hash + source_hash + msgpack
         let mut sign_data = Vec::with_capacity(16 + 16 + msgpack.len());
         sign_data.extend_from_slice(&dest_arr);
         sign_data.extend_from_slice(&source_hash_bytes);
@@ -444,7 +492,7 @@ impl LxmfNode {
         lxmf_payload.extend_from_slice(&signature);
         lxmf_payload.extend_from_slice(&msgpack);
 
-        info!("LxmfNode::send_to: dest={} payload={}B", dest_hex, lxmf_payload.len());
+        info!("LxmfNode::send_to: seq={} dest={} payload={}B", seq, dest_hex, lxmf_payload.len());
 
         let packet = Packet {
             destination: AddressHash::new(dest_arr),
@@ -459,11 +507,16 @@ impl LxmfNode {
 
         match outcome {
             SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => {
-                info!("LxmfNode::send_to: dispatched ({outcome:?})");
-                Ok(())
+                info!("LxmfNode::send_to: dispatched seq={} ({outcome:?})", seq);
+                Ok(seq)
             }
+            // Peer hasn't announced yet — queue for opportunistic delivery when they announce
             SendPacketOutcome::DroppedMissingDestinationIdentity => {
-                Err(format!("missing destination identity for /{dest_hex}/"))
+                warn!("LxmfNode::send_to: queued seq={} (no identity for {dest_hex})", seq);
+                if let Ok(mut q) = pending_sends.lock() {
+                    q.push(PendingSend { seq, dest: dest_arr, lxmf_payload });
+                }
+                Ok(seq)
             }
             SendPacketOutcome::DroppedNoRoute => {
                 Err(format!("no route to /{dest_hex}/"))

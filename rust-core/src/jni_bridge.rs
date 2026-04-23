@@ -222,7 +222,7 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeSend(
     };
 
     match LxmfNode::send_to(&dest, &data) {
-        Ok(()) => 0,
+        Ok(seq) => seq as jlong,
         Err(e) => {
             error!("LxmfModule: send_to failed: {}", e);
             -1
@@ -267,7 +267,7 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBroadcast(
     let mut sent: i64 = 0;
     for dest in &dests {
         match LxmfNode::send_to(dest, &data) {
-            Ok(()) => sent += 1,
+            Ok(_) => sent += 1,
             Err(e) => error!("LxmfModule: broadcast send_to {} failed: {}", dest, e),
         }
     }
