@@ -211,7 +211,7 @@ impl LxmfNode {
 
         // Set up transport synchronously so we can store the handle
         let name_bytes_init = name_bytes.clone();
-        let (transport_arc, my_dest, mut data_rx, announce_rx, lxmf_addr_hex) = rt.block_on(async move {
+        let (transport_arc, my_dest, mut data_rx, mut resource_rx, announce_rx, lxmf_addr_hex) = rt.block_on(async move {
             let config = TransportConfig::new("lxmf-mobile", &private_identity, true);
             let mut transport = Transport::new(config);
 
@@ -245,11 +245,12 @@ impl LxmfNode {
             info!("LxmfNode: sending announce as {}", lxmf_addr_hex);
             transport.send_announce(&my_dest, Some(name_bytes_init.as_slice())).await;
 
-            let data_rx = transport.received_data_events();
+            let data_rx = transport.in_link_events();
+            let resource_rx = transport.resource_events();
             let announce_rx = transport.recv_announces().await;
 
             let arc = Arc::new(tokio::sync::Mutex::new(transport));
-            (arc, my_dest, data_rx, announce_rx, lxmf_addr_hex)
+            (arc, my_dest, data_rx, resource_rx, announce_rx, lxmf_addr_hex)
         });
 
         let addr_hex = lxmf_addr_hex;
@@ -288,29 +289,64 @@ impl LxmfNode {
             }
         });
 
-        // Spawn data receiver
+        // Spawn data receiver — uses in_link_events() to avoid echo of own outbound packets
         let events_data = Arc::clone(&events);
         rt.spawn(async move {
+            use rns_transport::destination::link::LinkEvent;
             loop {
                 match data_rx.recv().await {
-                    Ok(received) => {
-                        let mut src = [0u8; 16];
-                        src.copy_from_slice(received.destination.as_slice());
-                        let data = received.data.as_slice().to_vec();
-                        info!("LxmfNode: received {} bytes from {}", data.len(), hex::encode(&src));
-                        if let Ok(mut eq) = events_data.lock() {
-                            eq.push_back(LxmfEvent::MessageReceived {
-                                source: src,
-                                content: data,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                            });
+                    Ok(event) => {
+                        if let LinkEvent::Data(payload) = event.event {
+                            let mut src = [0u8; 16];
+                            src.copy_from_slice(event.address_hash.as_slice());
+                            let data = payload.as_slice().to_vec();
+                            info!("LxmfNode: received {} bytes from {}", data.len(), hex::encode(&src));
+                            if let Ok(mut eq) = events_data.lock() {
+                                eq.push_back(LxmfEvent::MessageReceived {
+                                    source: src,
+                                    content: data,
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                });
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("LxmfNode: lagged {} data events", n);
+                        warn!("LxmfNode: lagged {} link events", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Spawn resource receiver — handles large messages (>MTU) delivered via resource transfer
+        let events_res = Arc::clone(&events);
+        rt.spawn(async move {
+            use rns_transport::resource::ResourceEventKind;
+            loop {
+                match resource_rx.recv().await {
+                    Ok(event) => {
+                        if let ResourceEventKind::Complete(complete) = event.kind {
+                            let mut src = [0u8; 16];
+                            src.copy_from_slice(event.link_id.as_slice());
+                            let data = complete.data;
+                            info!("LxmfNode: resource complete {} bytes from {}", data.len(), hex::encode(&src));
+                            if let Ok(mut eq) = events_res.lock() {
+                                eq.push_back(LxmfEvent::MessageReceived {
+                                    source: src,
+                                    content: data,
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                });
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("LxmfNode: lagged {} resource events", n);
                     }
                     Err(_) => break,
                 }

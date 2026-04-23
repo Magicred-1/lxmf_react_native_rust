@@ -1,15 +1,16 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   PermissionsAndroid,
   Platform,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
-import { LxmfNodeMode, type LxmfEvent, useLxmf } from '@lxmf/react-native';
+import { LxmfNodeMode, type LxmfEvent, useLxmf } from '@magicred-1/react-native-lxmf';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -53,6 +54,31 @@ function fmtTime(e: LxmfEvent): string {
     .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+/** Try to extract human-readable text from raw LXMF hex content.
+ *  Wire format: dest(16) + src(16) + sig(64) + msgpack_payload = 96B header
+ *  Falls back to showing byte count. */
+function decodeLxmfContent(hexOrStr: string | undefined): string {
+  if (!hexOrStr) return '';
+  const hex = String(hexOrStr);
+  // Not hex — just show as-is
+  if (!/^[0-9a-fA-F]+$/.test(hex)) return hex;
+  const len = hex.length / 2;
+  if (len <= 96) return `[${len}B raw]`;
+  try {
+    const payload = new Uint8Array(len - 96);
+    for (let i = 0; i < payload.length; i++) {
+      payload[i] = parseInt(hex.slice((i + 96) * 2, (i + 96) * 2 + 2), 16);
+    }
+    const decoded = new TextDecoder('utf-8', { fatal: false }).decode(payload);
+    // Strip non-printable except common whitespace
+    const printable = decoded.replace(/[^\x20-\x7E\n\r\t]/g, '').trim();
+    if (printable.length >= 3) return printable;
+    return `[${len}B binary]`;
+  } catch {
+    return `[${len}B]`;
+  }
+}
+
 function evtSummary(e: LxmfEvent): string {
   if (e.type === 'announceReceived') {
     const from = shortHex(String(e.destHash ?? e.address ?? e.source ?? '?'));
@@ -69,6 +95,12 @@ function evtKey(e: LxmfEvent, prefix = ''): string {
   const t = ts(e) ?? 'na';
   const m = String(e.id ?? e.receipt ?? e.destHash ?? e.source ?? e.message ?? 'ev');
   return `${prefix}${e.type}-${t}-${m}`;
+}
+
+async function copyToClipboard(text: string) {
+  try {
+    await Share.share({ message: text });
+  } catch {}
 }
 
 // ── Accordion ─────────────────────────────────────────────────────────────────
@@ -121,11 +153,18 @@ function Btn({
   );
 }
 
-function Row({ label, value }: Readonly<{ label: string; value: string }>) {
+function Row({ label, value, onCopy }: Readonly<{ label: string; value: string; onCopy?: () => void }>) {
   return (
     <View style={S.statRow}>
       <Text style={S.statLabel}>{label}</Text>
-      <Text selectable style={S.statValue}>{value}</Text>
+      <View style={S.statValueRow}>
+        <Text selectable style={S.statValue}>{value}</Text>
+        {onCopy ? (
+          <Pressable onPress={onCopy} style={S.copyBtn}>
+            <Text style={S.copyBtnText}>⎘</Text>
+          </Pressable>
+        ) : null}
+      </View>
     </View>
   );
 }
@@ -140,12 +179,11 @@ function Pill({ label, active }: Readonly<{ label: string; active: boolean }>) {
 
 // ── Main screen ──────────────────────────────────────────────────────────────
 
-const SEED = 'new';
-
 export default function HomeScreen() {
   // Transport state
   const [tcpHost, setTcpHost] = useState('192.168.1.135');
   const [tcpPort, setTcpPort] = useState('4243');
+  const [displayName, setDisplayName] = useState('lxmf-mobile');
   const [bleActive, setBleActive] = useState(false);
   const [tcpActive, setTcpActive] = useState(false);
   const [transportMsg, setTransportMsg] = useState('');
@@ -160,7 +198,7 @@ export default function HomeScreen() {
   const {
     isNativeAvailable, isRunning, status, error, events, beacons,
     start, stop, send, getStatus, startBLE, stopBLE, bleUnpairedRNodeCount,
-  } = useLxmf({ identityHex: SEED, lxmfAddressHex: SEED, logLevel: 3 });
+  } = useLxmf({ identityHex: 'new', lxmfAddressHex: 'new', logLevel: 3 });
 
   // ── Derived ───────────────────────────────────────────────────────────────
 
@@ -188,9 +226,13 @@ export default function HomeScreen() {
     const port = Number(tcpPort);
     if (!host) { setTransportMsg('Host required.'); return; }
     if (!Number.isInteger(port) || port < 1 || port > 65535) { setTransportMsg('Port 1–65535.'); return; }
-    const ok = await start({ mode: LxmfNodeMode.Reticulum, tcpInterfaces: [{ host, port }] });
+    const ok = await start({
+      mode: LxmfNodeMode.Reticulum,
+      tcpInterfaces: [{ host, port }],
+      displayName: displayName.trim() || 'lxmf-mobile',
+    });
     if (ok) setTcpActive(true);
-  }, [tcpHost, tcpPort, start]);
+  }, [tcpHost, tcpPort, displayName, start]);
 
   const onStopTcp = useCallback(async () => {
     await stop();
@@ -239,6 +281,14 @@ export default function HomeScreen() {
     setSendResult(r >= 0 ? `Receipt #${r}` : 'Send failed.');
   }, [dest, msgText, send]);
 
+  const copyIdentity = useCallback(() => {
+    if (status?.identityHex) copyToClipboard(status.identityHex);
+  }, [status?.identityHex]);
+
+  const copyAddress = useCallback(() => {
+    if (status?.addressHex) copyToClipboard(status.addressHex);
+  }, [status?.addressHex]);
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
@@ -265,8 +315,16 @@ export default function HomeScreen() {
       <Accordion title="Node Status" defaultOpen>
         <Row label="Native module" value={isNativeAvailable ? 'Loaded ✓' : 'Missing ✗'} />
         <Row label="State" value={isRunning ? 'Running' : 'Stopped'} />
-        <Row label="Identity" value={shortHex(status?.identityHex ?? '')} />
-        <Row label="Address" value={shortHex(status?.addressHex ?? '')} />
+        <Row
+          label="Identity"
+          value={status?.identityHex ? shortHex(status.identityHex) : '—'}
+          onCopy={status?.identityHex ? copyIdentity : undefined}
+        />
+        <Row
+          label="Address"
+          value={status?.addressHex ? shortHex(status.addressHex) : '—'}
+          onCopy={status?.addressHex ? copyAddress : undefined}
+        />
         <Row label="Announces" value={String(status?.announcesReceived ?? 0)} />
         <Row label="Messages" value={String(status?.lxmfMessagesReceived ?? 0)} />
         <Row label="Outbound sent" value={String(status?.outboundSent ?? 0)} />
@@ -295,6 +353,15 @@ export default function HomeScreen() {
           value={tcpPort}
           onChangeText={setTcpPort}
           keyboardType="number-pad"
+        />
+        <TextInput
+          style={S.input}
+          placeholder="Display name (e.g. lxmf-mobile)"
+          placeholderTextColor="#607080"
+          value={displayName}
+          onChangeText={setDisplayName}
+          autoCapitalize="none"
+          autoCorrect={false}
         />
         {transportMsg ? <Text style={S.warn}>{transportMsg}</Text> : null}
         <View style={S.btnRow}>
@@ -365,6 +432,7 @@ export default function HomeScreen() {
           announceEvts.map((e: LxmfEvent, i: number) => (
             <View key={`${evtKey(e, 'ann-')}-${i}`} style={S.itemCard}>
               <Text selectable style={S.itemTitle}>{evtSummary(e)}</Text>
+              {e.appData ? <Text selectable style={S.itemBody}>{String(e.appData)}</Text> : null}
               <Text style={S.itemMeta}>{fmtTime(e)}</Text>
             </View>
           ))
@@ -372,19 +440,24 @@ export default function HomeScreen() {
       </Accordion>
 
       {/* ── Messages ─────────────────────────────────────────────────────── */}
-      <Accordion title="Messages" badge={counts.messages} defaultOpen={false}>
+      <Accordion title="Messages" badge={counts.messages} defaultOpen>
         {msgEvts.length === 0 ? (
           <Text style={S.muted}>No messages yet.</Text>
         ) : (
-          msgEvts.map((e, i) => (
-            <View key={`${evtKey(e, 'msg-')}-${i}`} style={S.itemCard}>
-              <Text selectable style={S.itemTitle}>{evtSummary(e)}</Text>
-              {e.content ? (
-                <Text selectable style={S.itemBody}>{String(e.content)}</Text>
-              ) : null}
-              <Text style={S.itemMeta}>{fmtTime(e)}</Text>
-            </View>
-          ))
+          msgEvts.map((e, i) => {
+            const body = decodeLxmfContent(e.content);
+            return (
+              <View key={`${evtKey(e, 'msg-')}-${i}`} style={S.itemCard}>
+                <Text selectable style={S.itemTitle}>
+                  From: {shortHex(String(e.source ?? '?'))}
+                </Text>
+                {body ? (
+                  <Text selectable style={S.itemBody}>{body}</Text>
+                ) : null}
+                <Text style={S.itemMeta}>{fmtTime(e)}</Text>
+              </View>
+            );
+          })
         )}
       </Accordion>
 
@@ -516,7 +589,17 @@ const S = StyleSheet.create({
   // Stat rows
   statRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   statLabel: { color: C.textDim, fontSize: 13 },
+  statValueRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   statValue: { color: C.text, fontSize: 13, fontFamily: 'monospace' },
+  copyBtn: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    backgroundColor: '#0d3550',
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  copyBtnText: { color: C.accentBright, fontSize: 13 },
 
   hint: { color: C.textDim, fontSize: 12, marginBottom: 2 },
 
