@@ -73,6 +73,26 @@ pub unsafe extern "C" fn lxmf_is_running() -> i32 {
     if LxmfNode::is_running() { 1 } else { 0 }
 }
 
+// --- Identity ---
+
+/// Write the full 128-char private identity hex into `out_buf` for persistence.
+///
+/// Returns the number of bytes written (always 128 on success), 0 if no node is
+/// initialized, or a negative error code. The identity hex contains the private
+/// key — callers must persist it to encrypted/secure storage.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_get_identity_hex(out_buf: *mut u8, out_capacity: usize) -> i32 {
+    if out_buf.is_null() { return STATUS_ERR; }
+    let hex = match LxmfNode::get_identity_hex() {
+        Some(s) => s,
+        None => return 0,
+    };
+    let bytes = hex.as_bytes();
+    if bytes.len() > out_capacity { return STATUS_ERR; }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+    bytes.len() as i32
+}
+
 // --- Status ---
 
 #[no_mangle]

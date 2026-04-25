@@ -303,6 +303,19 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     return LxmfModule.setLogLevel(level);
   }, []);
 
+  /**
+   * Returns the full 128-char private identity hex for persistence, or null
+   * if no node is initialized. Persist to encrypted storage (e.g. expo-secure-store)
+   * and pass back via UseLxmfOptions.identityHex on next mount to reuse the identity.
+   */
+  const getIdentityHex = useCallback((): string | null => {
+    try {
+      return LxmfModule.getIdentityHex();
+    } catch {
+      return null;
+    }
+  }, []);
+
   const startBLE = useCallback(() => {
     LxmfModule.startBLE();
   }, []);
@@ -332,6 +345,7 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     getStatus,
     getBeacons,
     fetchMessages,
+    getIdentityHex,
     setLogLevel,
     startBLE,
     stopBLE,

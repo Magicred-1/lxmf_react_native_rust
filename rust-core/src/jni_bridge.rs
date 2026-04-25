@@ -134,6 +134,24 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativePollEvents(
     }
 }
 
+// --- Identity ---
+
+/// Return the full 128-char private identity hex for persistence,
+/// or null if no node is initialized.
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetIdentityHex(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    match LxmfNode::get_identity_hex() {
+        Some(hex) => match env.new_string(&hex) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
 // --- Status ---
 
 #[no_mangle]

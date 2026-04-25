@@ -44,6 +44,12 @@ func lxmf_poll_events(
     _ outCapacity: Int
 ) -> Int32
 
+@_silgen_name("lxmf_get_identity_hex")
+func lxmf_get_identity_hex(
+    _ outBuf: UnsafeMutablePointer<UInt8>?,
+    _ outCapacity: Int
+) -> Int32
+
 @_silgen_name("lxmf_get_status")
 func lxmf_get_status(
     _ outBuf: UnsafeMutablePointer<UInt8>?,
@@ -257,6 +263,19 @@ public class LxmfModule: Module {
                 }
             }
             return Double(opId)
+        }
+
+        // --- Identity ---
+
+        Function("getIdentityHex") { () -> String? in
+            // 128 hex chars (full private key) — small, dedicated buffer to avoid
+            // sharing with the larger status JSON buffer.
+            var buf = [UInt8](repeating: 0, count: 256)
+            let len = buf.withUnsafeMutableBufferPointer { ptr in
+                lxmf_get_identity_hex(ptr.baseAddress, ptr.count)
+            }
+            guard len > 0 else { return nil }
+            return String(bytes: buf[0..<Int(len)], encoding: .utf8)
         }
 
         // --- Status & Beacons ---

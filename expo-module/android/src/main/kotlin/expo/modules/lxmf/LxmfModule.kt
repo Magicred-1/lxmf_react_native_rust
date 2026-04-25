@@ -100,6 +100,11 @@ class LxmfModule : Module() {
       nativeBroadcast(destsJson, bodyBase64).toDouble()
     }
 
+    // Identity
+    Function("getIdentityHex") {
+      nativeGetIdentityHex()
+    }
+
     // Status & State
     Function("getStatus") {
       nativeGetStatus()
@@ -197,6 +202,7 @@ class LxmfModule : Module() {
   private external fun nativePollEvents(): String?
   private external fun nativeSend(destHex: String, bodyBase64: String): Long
   private external fun nativeBroadcast(destsJson: String, bodyBase64: String): Long
+  private external fun nativeGetIdentityHex(): String?
   private external fun nativeGetStatus(): String?
   private external fun nativeGetBeacons(): String?
   private external fun nativeFetchMessages(limit: Int): String?

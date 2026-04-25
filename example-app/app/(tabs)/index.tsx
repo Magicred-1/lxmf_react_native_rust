@@ -10,7 +10,31 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
 import { LxmfNodeMode, type LxmfEvent, useLxmf } from '@magicred-1/react-native-lxmf';
+
+// Persisted identity blob schema (versioned). Stored in expo-secure-store under
+// IDENTITY_KEY — encrypted at rest on iOS (Keychain) and Android (Keystore-backed).
+// Schema version bumps allow forward-compatible migrations if the FFI changes.
+const IDENTITY_KEY = 'lxmf.identity.v1';
+const IDENTITY_SCHEMA_VERSION = 1;
+type StoredIdentity = {
+  version: number;
+  identity_hex: string;   // 128 hex chars (private key)
+  address_hex: string;    // 32 hex chars (LXMF address)
+  created_at: string;     // ISO8601
+};
+
+function isValidIdentity(blob: unknown): blob is StoredIdentity {
+  if (!blob || typeof blob !== 'object') return false;
+  const b = blob as Record<string, unknown>;
+  return (
+    typeof b.version === 'number' &&
+    typeof b.identity_hex === 'string' && /^[0-9a-fA-F]{128}$/.test(b.identity_hex) &&
+    typeof b.address_hex === 'string' && /^[0-9a-fA-F]{32}$/.test(b.address_hex) &&
+    typeof b.created_at === 'string'
+  );
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -192,10 +216,62 @@ export default function HomeScreen() {
 
   const [unpairedRNodes, setUnpairedRNodes] = useState(0);
 
+  // Identity hydration: read once from secure store on mount. Until hydrated,
+  // we pass 'new' so Rust generates a fresh identity (which we'll then persist
+  // after start succeeds, see effect below).
+  const [storedIdentity, setStoredIdentity] = useState<StoredIdentity | null>(null);
+  const [identityHydrated, setIdentityHydrated] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await SecureStore.getItemAsync(IDENTITY_KEY);
+        if (cancelled) return;
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (isValidIdentity(parsed)) {
+            setStoredIdentity(parsed);
+          }
+        }
+      } catch {
+        // Corrupt blob or storage error — fall through; we'll generate fresh.
+      } finally {
+        if (!cancelled) setIdentityHydrated(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const {
     isNativeAvailable, isRunning, status, error, events, beacons,
-    start, stop, send, getStatus, startBLE, stopBLE, bleUnpairedRNodeCount,
-  } = useLxmf({ identityHex: 'new', lxmfAddressHex: 'new', logLevel: 3 });
+    start, stop, send, getStatus, getIdentityHex,
+    startBLE, stopBLE, bleUnpairedRNodeCount,
+  } = useLxmf({
+    identityHex: storedIdentity?.identity_hex ?? 'new',
+    lxmfAddressHex: storedIdentity?.address_hex ?? 'new',
+    logLevel: 3,
+  });
+
+  // Persist identity after node starts successfully (only if not already stored,
+  // or if the running identity differs — defensive against schema migrations).
+  useEffect(() => {
+    if (!isRunning) return;
+    const idHex = getIdentityHex();
+    const addrHex = status?.addressHex;
+    if (!idHex || idHex.length !== 128) return;
+    if (!addrHex || !/^[0-9a-fA-F]{32}$/.test(addrHex)) return;
+    if (storedIdentity?.identity_hex === idHex && storedIdentity?.address_hex === addrHex) return;
+
+    const blob: StoredIdentity = {
+      version: IDENTITY_SCHEMA_VERSION,
+      identity_hex: idHex,
+      address_hex: addrHex,
+      created_at: new Date().toISOString(),
+    };
+    SecureStore.setItemAsync(IDENTITY_KEY, JSON.stringify(blob))
+      .then(() => setStoredIdentity(blob))
+      .catch(() => { /* persistence failure is non-fatal for the running session */ });
+  }, [isRunning, status?.addressHex, storedIdentity, getIdentityHex]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
 
@@ -362,7 +438,7 @@ export default function HomeScreen() {
         />
         {transportMsg ? <Text style={S.warn}>{transportMsg}</Text> : null}
         <View style={S.btnRow}>
-          <Btn label="Start TCP" onPress={onStartTcp} disabled={!isNativeAvailable || isRunning} />
+          <Btn label="Start TCP" onPress={onStartTcp} disabled={!isNativeAvailable || isRunning || !identityHydrated} />
           <Btn label="Stop TCP" onPress={onStopTcp} disabled={!isRunning} danger />
         </View>
       </Accordion>
@@ -378,7 +454,7 @@ export default function HomeScreen() {
           </Text>
         )}
         <View style={S.btnRow}>
-          <Btn label="Start BLE" onPress={onStartBle} disabled={bleActive} />
+          <Btn label="Start BLE" onPress={onStartBle} disabled={bleActive || !identityHydrated} />
           <Btn label="Stop BLE" onPress={onStopBle} disabled={!bleActive} danger />
         </View>
       </Accordion>
