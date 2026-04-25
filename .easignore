@@ -1,0 +1,17 @@
+# EAS Build context is the parent repo (because .git lives here).
+# Exclude everything except example-app to keep the upload small and
+# prevent yarn from walking up into expo-module/ or rust-core/.
+
+expo-module/
+rust-core/
+scripts/
+node_modules/
+.git/
+*.md
+package.json
+# Note: keep example-app/ implicitly (no exclusion rule for it)
+
+# Cruft
+.DS_Store
+*.log
+firmware_backup_*.bin
