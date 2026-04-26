@@ -9,12 +9,16 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.magicred1.exampleapp",
+      "bundleIdentifier": "com.fwazb.exampleapp",
       "infoPlist": {
         "NSBluetoothAlwaysUsageDescription": "AnonMesh uses Bluetooth to connect to LoRa relay nodes for offline Solana transactions.",
         "NSBluetoothPeripheralUsageDescription": "AnonMesh uses Bluetooth to communicate with nearby mesh nodes.",
         "NSLocalNetworkUsageDescription": "AnonMesh uses local network to connect to mesh relay nodes and Reticulum transport.",
-        "UIBackgroundModes": ["bluetooth-central", "bluetooth-peripheral"]
+        "UIBackgroundModes": [
+          "bluetooth-central",
+          "bluetooth-peripheral"
+        ],
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -33,7 +37,7 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "package": "com.magicred1.exampleapp"
+      "package": "com.fwazb.exampleapp"
     },
     "web": {
       "output": "static",
@@ -57,6 +61,12 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "a01c4460-cacc-4f87-a9c3-ea86c57623e9"
+      }
     }
   }
 }

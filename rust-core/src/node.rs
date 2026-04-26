@@ -95,6 +95,10 @@ pub struct LxmfNode {
     pub messages_received: u64,
     /// Opportunistic send queue: messages awaiting a peer announce before delivery
     pending_sends: Arc<Mutex<Vec<PendingSend>>>,
+    /// JoinHandles for every task spawned during start_*. Aborted on stop()
+    /// to prevent zombie tasks accumulating across Stop/Start cycles and mode
+    /// switches (each leaked task fires its own timers and pollutes logs).
+    task_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 // Access through Mutex
@@ -130,6 +134,7 @@ impl LxmfNode {
             announces_received: 0,
             messages_received: 0,
             pending_sends: Arc::new(Mutex::new(Vec::new())),
+            task_handles: Vec::new(),
         };
 
         // Clear stale BLE peer list from any previous session in this process
@@ -161,7 +166,7 @@ impl LxmfNode {
         match mode {
             3 => {
                 let interfaces = parse_interfaces_json(interfaces_json)?;
-                Self::start_reticulum(identity_hex, address_hex, &interfaces, announce_interval_ms, display_name)
+                Self::start_reticulum(identity_hex, &interfaces, announce_interval_ms, display_name)
             }
             0 => Self::start_ble(identity_hex, address_hex, display_name),
             _ => Err(format!("Unsupported mode: {}. Use 0 (BLE) or 3 (Reticulum TCP)", mode)),
@@ -171,7 +176,6 @@ impl LxmfNode {
     /// Start with full Reticulum transport (mode 3)
     fn start_reticulum(
         identity_hex: &str,
-        address_hex: &str,
         interfaces: &[(String, u16)],
         announce_interval_ms: u64,
         display_name: &str,
@@ -256,7 +260,13 @@ impl LxmfNode {
             info!("LxmfNode: sending announce as {}", lxmf_addr_hex);
             transport.send_announce(&my_dest, Some(name_bytes_init.as_slice())).await;
 
-            let data_rx = transport.in_link_events();
+            // Subscribe to received_data_events() rather than in_link_events().
+            // received_data_events() is the wider stream — it surfaces both
+            // single-shot destination-encrypted packets (what send_to produces)
+            // AND link-carried data. in_link_events() only fires for packets
+            // inside an established Reticulum Link, so direct unicast was being
+            // silently dropped from the user-visible event stream.
+            let data_rx = transport.received_data_events();
             let resource_rx = transport.resource_events();
             let announce_rx = transport.recv_announces().await;
 
@@ -279,10 +289,14 @@ impl LxmfNode {
         };
         let transport_for_ann = Arc::clone(&transport_arc);
 
+        // Collect JoinHandles so stop() can abort every spawned task and
+        // prevent zombie task accumulation across Stop/Start cycles.
+        let mut task_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
         // Spawn announce receiver
         let events_ann = Arc::clone(&events);
         let mut announce_rx = announce_rx;
-        rt.spawn(async move {
+        task_handles.push(rt.spawn(async move {
             loop {
                 match announce_rx.recv().await {
                     Ok(event) => {
@@ -334,43 +348,42 @@ impl LxmfNode {
                     Err(_) => break,
                 }
             }
-        });
+        }));
 
-        // Spawn data receiver — uses in_link_events() to avoid echo of own outbound packets
+        // Spawn data receiver — consumes received_data_events() (single-shot
+        // destination-encrypted packets + link-carried data, see subscription
+        // comment above). Mirrors the BLE-mode receiver shape.
         let events_data = Arc::clone(&events);
-        rt.spawn(async move {
-            use rns_transport::destination::link::LinkEvent;
+        task_handles.push(rt.spawn(async move {
             loop {
                 match data_rx.recv().await {
-                    Ok(event) => {
-                        if let LinkEvent::Data(payload) = event.event {
-                            let mut src = [0u8; 16];
-                            src.copy_from_slice(event.address_hash.as_slice());
-                            let data = payload.as_slice().to_vec();
-                            info!("LxmfNode: received {} bytes from {}", data.len(), hex::encode(&src));
-                            if let Ok(mut eq) = events_data.lock() {
-                                eq.push_back(LxmfEvent::MessageReceived {
-                                    source: src,
-                                    content: data,
-                                    timestamp: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                });
-                            }
+                    Ok(received) => {
+                        let mut src = [0u8; 16];
+                        src.copy_from_slice(received.destination.as_slice());
+                        let data = received.data.as_slice().to_vec();
+                        info!("LxmfNode: received {} bytes from {}", data.len(), hex::encode(&src));
+                        if let Ok(mut eq) = events_data.lock() {
+                            eq.push_back(LxmfEvent::MessageReceived {
+                                source: src,
+                                content: data,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            });
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("LxmfNode: lagged {} link events", n);
+                        warn!("LxmfNode: lagged {} data events", n);
                     }
                     Err(_) => break,
                 }
             }
-        });
+        }));
 
         // Spawn resource receiver — handles large messages (>MTU) delivered via resource transfer
         let events_res = Arc::clone(&events);
-        rt.spawn(async move {
+        task_handles.push(rt.spawn(async move {
             use rns_transport::resource::ResourceEventKind;
             loop {
                 match resource_rx.recv().await {
@@ -398,12 +411,12 @@ impl LxmfNode {
                     Err(_) => break,
                 }
             }
-        });
+        }));
 
         // Spawn periodic re-announce
         let transport_reannounce = Arc::clone(&transport_arc);
         let interval_ms = if announce_interval_ms > 0 { announce_interval_ms } else { 300_000 };
-        rt.spawn(async move {
+        task_handles.push(rt.spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms)).await;
                 info!("LxmfNode: periodic re-announce");
@@ -413,7 +426,7 @@ impl LxmfNode {
                     .send_announce(&my_dest, Some(name_bytes.as_slice()))
                     .await;
             }
-        });
+        }));
 
         info!("LxmfNode: LXMF delivery address = {}", addr_hex);
 
@@ -426,6 +439,7 @@ impl LxmfNode {
         node.address_hex = addr_hex;
         node.identity_bytes = Some(id_bytes);
         node.transport = Some(transport_arc);
+        node.task_handles = task_handles;
 
         info!("LxmfNode: Reticulum transport started");
         Ok(())
@@ -565,6 +579,9 @@ impl LxmfNode {
 
         let rt = get_runtime();
         let display_name = display_name.to_owned();
+        // Clone for the periodic re-announce task spawned below; the original
+        // is moved into the rt.block_on async block.
+        let display_name_reann = display_name.clone();
 
         let (transport_arc, my_dest, mut data_rx, announce_rx, addr_hex) =
             rt.block_on(async move {
@@ -614,10 +631,14 @@ impl LxmfNode {
             eq.push_back(LxmfEvent::StatusChanged { running: true, lifecycle: 0 });
         }
 
+        // Collect JoinHandles so stop() can abort every spawned task and
+        // prevent zombie task accumulation across Stop/Start cycles.
+        let mut task_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
         // Spawn announce receiver.
         let events_ann = Arc::clone(&events);
         let mut announce_rx = announce_rx;
-        rt.spawn(async move {
+        task_handles.push(rt.spawn(async move {
             loop {
                 match announce_rx.recv().await {
                     Ok(event) => {
@@ -641,11 +662,11 @@ impl LxmfNode {
                     Err(_) => break,
                 }
             }
-        });
+        }));
 
         // Spawn data receiver.
         let events_data = Arc::clone(&events);
-        rt.spawn(async move {
+        task_handles.push(rt.spawn(async move {
             loop {
                 match data_rx.recv().await {
                     Ok(received) => {
@@ -670,7 +691,66 @@ impl LxmfNode {
                     Err(_) => break,
                 }
             }
-        });
+        }));
+
+        // Spawn periodic re-announce — mirrors mode 3 (TCP). The initial announce
+        // emitted inside the setup block above fires before BLE peers have
+        // completed their GATT subscribe handshake (~1-2s race), so peers miss
+        // it. This loop fires another announce 5s after start (giving peers time
+        // to subscribe), then continues at the configured interval. Without this,
+        // peers never learn each other's identity and unicast send_to remains
+        // queued in the opportunistic-retry buffer indefinitely.
+        let transport_reannounce = Arc::clone(&transport_arc);
+        let dest_reannounce = Arc::clone(&my_dest);
+        let name_bytes_reann: Vec<u8> = if display_name_reann.is_empty() {
+            b"lxmf-mobile".to_vec()
+        } else {
+            display_name_reann.as_bytes()[..display_name_reann.len().min(32)].to_vec()
+        };
+        // Event-driven re-announce on BLE peer connect. The 5s periodic timer
+        // below handles the cold-start case; this handles the case where a peer
+        // (re)connects later and would otherwise wait up to 300s for the next
+        // periodic announce. Cheap: a Notify is essentially free until fired.
+        let transport_pc = Arc::clone(&transport_arc);
+        let dest_pc = Arc::clone(&my_dest);
+        let name_bytes_pc = name_bytes_reann.clone();
+        let notify = crate::ble_iface::peer_connected_notify();
+        task_handles.push(rt.spawn(async move {
+            loop {
+                notify.notified().await;
+                // Small grace window for GATT subscribe to complete on the new peer.
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                info!("LxmfNode BLE: re-announce on peer connect");
+                transport_pc
+                    .lock()
+                    .await
+                    .send_announce(&dest_pc, Some(name_bytes_pc.as_slice()))
+                    .await;
+            }
+        }));
+
+        task_handles.push(rt.spawn(async move {
+            // Initial post-connect re-announce: 5s after start gives peers time
+            // to complete the GATT subscribe handshake.
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            info!("LxmfNode BLE: periodic re-announce (initial post-connect)");
+            transport_reannounce
+                .lock()
+                .await
+                .send_announce(&dest_reannounce, Some(name_bytes_reann.as_slice()))
+                .await;
+
+            // Steady-state loop — same 5min default as TCP mode.
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+                info!("LxmfNode BLE: periodic re-announce");
+                transport_reannounce
+                    .lock()
+                    .await
+                    .send_announce(&dest_reannounce, Some(name_bytes_reann.as_slice()))
+                    .await;
+            }
+        }));
 
         // Update node state.
         let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
@@ -681,6 +761,7 @@ impl LxmfNode {
         node.address_hex = addr_hex;
         node.identity_bytes = Some(id_bytes);
         node.transport = Some(transport_arc);
+        node.task_handles = task_handles;
 
         info!("LxmfNode: BLE transport started");
         Ok(())
@@ -693,6 +774,18 @@ impl LxmfNode {
 
         if !node.running {
             return Ok(());
+        }
+
+        // Abort every task spawned by start_*. Without this, peer-connect
+        // listeners and periodic re-announce loops survive Stop and accumulate
+        // across Stop/Start cycles and mode switches, polluting logs and
+        // sending stray announces from prior sessions.
+        let aborted = node.task_handles.len();
+        for h in node.task_handles.drain(..) {
+            h.abort();
+        }
+        if aborted > 0 {
+            info!("LxmfNode: aborted {} background tasks", aborted);
         }
 
         // TODO: graceful transport shutdown

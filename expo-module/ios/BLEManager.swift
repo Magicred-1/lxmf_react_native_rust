@@ -53,6 +53,12 @@ class BLEManager: NSObject {
 
     private var isRunning = false
 
+    /// Per-launch random token embedded in our advertisement's local name, so
+    /// our central role can detect and skip our own peripheral advertisement
+    /// (CoreBluetooth does not auto-filter self when running both roles).
+    private var instanceTokenHex: String = ""
+    private static let advertNamePrefix = "lxmf-mesh-"
+
     private static let bondedKey = "lxmf.ble.bondedPeripheralUUIDs"
 
     private func loadBondedPeripherals() {
@@ -75,6 +81,35 @@ class BLEManager: NSObject {
         isRunning = true
         loadBondedPeripherals()
         discoveredUnpairedRNodes.removeAll()
+
+        // Generate fresh per-launch token for self-loop detection.
+        // CoreBluetooth doesn't filter our own peripheral when scanning, so we
+        // embed a random token in the advertised local name and skip matches.
+        var tokenBytes = [UInt8](repeating: 0, count: 4)
+        guard SecRandomCopyBytes(kSecRandomDefault, tokenBytes.count, &tokenBytes) == errSecSuccess else {
+            // CSPRNG failed — fall back to UUID bytes so two failing devices
+            // don't converge to all-zero tokens (deterministic collision).
+            let fallback = UUID().uuid
+            tokenBytes = [fallback.0, fallback.1, fallback.2, fallback.3]
+            instanceTokenHex = tokenBytes.map { String(format: "%02x", $0) }.joined()
+            // TODO(sentinel): remove or downgrade to debug before production
+            NSLog("[BLE] instance token (fallback): %@", instanceTokenHex)
+            // Use restoration identifiers for background BLE
+            centralManager = CBCentralManager(
+                delegate: self,
+                queue: DispatchQueue(label: "lxmf.ble.central"),
+                options: [CBCentralManagerOptionRestoreIdentifierKey: "lxmf-central"]
+            )
+            peripheralManager = CBPeripheralManager(
+                delegate: self,
+                queue: DispatchQueue(label: "lxmf.ble.peripheral"),
+                options: [CBPeripheralManagerOptionRestoreIdentifierKey: "lxmf-peripheral"]
+            )
+            return
+        }
+        instanceTokenHex = tokenBytes.map { String(format: "%02x", $0) }.joined()
+        // TODO(sentinel): remove or downgrade to debug before production
+        NSLog("[BLE] instance token: %@", instanceTokenHex)
 
         // Use restoration identifiers for background BLE
         centralManager = CBCentralManager(
@@ -231,7 +266,7 @@ class BLEManager: NSObject {
     private func startAdvertising() {
         peripheralManager.startAdvertising([
             CBAdvertisementDataServiceUUIDsKey: [BLEManager.meshServiceUUID],
-            CBAdvertisementDataLocalNameKey: "lxmf-mesh"
+            CBAdvertisementDataLocalNameKey: BLEManager.advertNamePrefix + instanceTokenHex
         ])
     }
 
@@ -257,6 +292,14 @@ extension BLEManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         guard connectedPeripherals[peripheral.identifier] == nil else { return }
+
+        // Self-loop filter: if the advertised local name carries our own
+        // instance token, this is our own peripheral being seen by our own
+        // central. Skip — CoreBluetooth does not auto-filter this.
+        if let advertName = advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+           advertName == BLEManager.advertNamePrefix + instanceTokenHex {
+            return
+        }
 
         // Check if this is an RNode (NUS service) that we haven't paired with yet.
         // If so, don't auto-connect — the user needs to pair in iOS Settings first.

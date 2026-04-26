@@ -9,7 +9,6 @@ use std::slice;
 
 use log::warn;
 use crate::node::{LxmfNode, DestHash};
-use crate::framing::{hdlc_encode, kiss_encode};
 
 pub const STATUS_OK: i32 = 0;
 pub const STATUS_ERR: i32 = -1;
@@ -71,6 +70,26 @@ pub unsafe extern "C" fn lxmf_stop() -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn lxmf_is_running() -> i32 {
     if LxmfNode::is_running() { 1 } else { 0 }
+}
+
+// --- Identity ---
+
+/// Write the full 128-char private identity hex into `out_buf` for persistence.
+///
+/// Returns the number of bytes written (always 128 on success), 0 if no node is
+/// initialized, or a negative error code. The identity hex contains the private
+/// key — callers must persist it to encrypted/secure storage.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_get_identity_hex(out_buf: *mut u8, out_capacity: usize) -> i32 {
+    if out_buf.is_null() { return STATUS_ERR; }
+    let hex = match LxmfNode::get_identity_hex() {
+        Some(s) => s,
+        None => return 0,
+    };
+    let bytes = hex.as_bytes();
+    if bytes.len() > out_capacity { return STATUS_ERR; }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+    bytes.len() as i32
 }
 
 // --- Status ---
@@ -250,30 +269,6 @@ pub unsafe extern "C" fn lxmf_set_log_level(level: u32) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn lxmf_abi_version() -> u32 { LxmfNode::abi_version() }
-
-// --- Framing helpers ---
-
-#[no_mangle]
-pub unsafe extern "C" fn lxmf_hdlc_encode(
-    data_ptr: *const u8, data_len: usize, out_ptr: *mut u8, out_capacity: usize,
-) -> i32 {
-    if data_ptr.is_null() || out_ptr.is_null() { return STATUS_ERR; }
-    let encoded = hdlc_encode(slice::from_raw_parts(data_ptr, data_len));
-    if encoded.len() > out_capacity { return STATUS_ERR; }
-    std::ptr::copy_nonoverlapping(encoded.as_ptr(), out_ptr, encoded.len());
-    encoded.len() as i32
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lxmf_kiss_encode(
-    data_ptr: *const u8, data_len: usize, out_ptr: *mut u8, out_capacity: usize,
-) -> i32 {
-    if data_ptr.is_null() || out_ptr.is_null() { return STATUS_ERR; }
-    let encoded = kiss_encode(slice::from_raw_parts(data_ptr, data_len));
-    if encoded.len() > out_capacity { return STATUS_ERR; }
-    std::ptr::copy_nonoverlapping(encoded.as_ptr(), out_ptr, encoded.len());
-    encoded.len() as i32
-}
 
 // --- BLE Interface (iOS C FFI) ---
 //

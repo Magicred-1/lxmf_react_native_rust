@@ -196,10 +196,6 @@ pub extern "C" fn lxmf_on_announce(
     app_data_ptr: *const u8,
     app_data_len: usize,
 ) -> i32
-
-// Frame codecs (for BLE transport)
-pub extern "C" fn lxmf_hdlc_encode(data_ptr: *const u8, data_len: usize, ...) -> i32
-pub extern "C" fn lxmf_kiss_encode(data_ptr: *const u8, data_len: usize, ...) -> i32
 ```
 
 ### Memory/Pointer Safety

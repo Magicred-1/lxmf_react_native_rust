@@ -10,7 +10,31 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
 import { LxmfNodeMode, type LxmfEvent, useLxmf } from '@magicred-1/react-native-lxmf';
+
+// Persisted identity blob schema (versioned). Stored in expo-secure-store under
+// IDENTITY_KEY — encrypted at rest on iOS (Keychain) and Android (Keystore-backed).
+// Schema version bumps allow forward-compatible migrations if the FFI changes.
+const IDENTITY_KEY = 'lxmf.identity.v1';
+const IDENTITY_SCHEMA_VERSION = 1;
+type StoredIdentity = {
+  version: number;
+  identity_hex: string;   // 128 hex chars (private key)
+  address_hex: string;    // 32 hex chars (LXMF address)
+  created_at: string;     // ISO8601
+};
+
+function isValidIdentity(blob: unknown): blob is StoredIdentity {
+  if (!blob || typeof blob !== 'object') return false;
+  const b = blob as Record<string, unknown>;
+  return (
+    typeof b.version === 'number' &&
+    typeof b.identity_hex === 'string' && /^[0-9a-fA-F]{128}$/.test(b.identity_hex) &&
+    typeof b.address_hex === 'string' && /^[0-9a-fA-F]{32}$/.test(b.address_hex) &&
+    typeof b.created_at === 'string'
+  );
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -192,10 +216,79 @@ export default function HomeScreen() {
 
   const [unpairedRNodes, setUnpairedRNodes] = useState(0);
 
+  // Identity hydration: read once from secure store on mount. Until hydrated,
+  // we pass 'new' so Rust generates a fresh identity (which we'll then persist
+  // after start succeeds, see effect below).
+  const [storedIdentity, setStoredIdentity] = useState<StoredIdentity | null>(null);
+  const [identityHydrated, setIdentityHydrated] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await SecureStore.getItemAsync(IDENTITY_KEY);
+        // TODO(sentinel): remove debug logs before merge — lengths/booleans only, no key material
+        console.log('[persist] hydrate', { hasRaw: !!raw, rawLen: raw?.length ?? 0 });
+        if (cancelled) return;
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          const valid = isValidIdentity(parsed);
+          console.log('[persist] parsed', { valid, hasIdHex: typeof parsed?.identity_hex === 'string', hasAddrHex: typeof parsed?.address_hex === 'string' });
+          if (valid) {
+            setStoredIdentity(parsed);
+          }
+        }
+      } catch (e: any) {
+        console.log('[persist] hydrate FAIL', e?.message ?? 'unknown');
+        // Corrupt blob or storage error — fall through; we'll generate fresh.
+      } finally {
+        if (!cancelled) setIdentityHydrated(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const {
     isNativeAvailable, isRunning, status, error, events, beacons,
-    start, stop, send, getStatus, startBLE, stopBLE, bleUnpairedRNodeCount,
-  } = useLxmf({ identityHex: 'new', lxmfAddressHex: 'new', logLevel: 3 });
+    start, stop, send, getStatus, getIdentityHex,
+    startBLE, stopBLE, bleUnpairedRNodeCount,
+  } = useLxmf({
+    identityHex: storedIdentity?.identity_hex ?? 'new',
+    lxmfAddressHex: storedIdentity?.address_hex ?? 'new',
+    logLevel: 3,
+  });
+
+  // Persist identity after node starts successfully (only if not already stored,
+  // or if the running identity differs — defensive against schema migrations).
+  useEffect(() => {
+    if (!isRunning) return;
+    const idHex = getIdentityHex();
+    const addrHex = status?.addressHex;
+    // TODO(sentinel): remove debug logs before merge — lengths/booleans only, no key material
+    console.log('[persist] save check', {
+      idHexLen: idHex?.length ?? 0,
+      addrHexLen: addrHex?.length ?? 0,
+      alreadyStoredSame: storedIdentity?.identity_hex === idHex && storedIdentity?.address_hex === addrHex,
+    });
+    if (!idHex || idHex.length !== 128) return;
+    if (!addrHex || !/^[0-9a-fA-F]{32}$/.test(addrHex)) return;
+    if (storedIdentity?.identity_hex === idHex && storedIdentity?.address_hex === addrHex) return;
+
+    const blob: StoredIdentity = {
+      version: IDENTITY_SCHEMA_VERSION,
+      identity_hex: idHex,
+      address_hex: addrHex,
+      created_at: new Date().toISOString(),
+    };
+    SecureStore.setItemAsync(IDENTITY_KEY, JSON.stringify(blob))
+      .then(() => {
+        console.log('[persist] save OK');
+        setStoredIdentity(blob);
+      })
+      .catch((e: any) => {
+        console.log('[persist] save FAIL', e?.message ?? 'unknown');
+        /* persistence failure is non-fatal for the running session */
+      });
+  }, [isRunning, status?.addressHex, storedIdentity, getIdentityHex]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
 
@@ -237,6 +330,7 @@ export default function HomeScreen() {
   }, [stop]);
 
   const onStartBle = useCallback(async () => {
+    setTransportMsg('');
     if (Platform.OS === 'android') {
       const perms = Platform.Version >= 31
         ? [
@@ -252,15 +346,33 @@ export default function HomeScreen() {
         return;
       }
     }
+    // Start LxmfNode in BLE-only mode (mode 0). Without this the node never
+    // initializes — Start BLE alone only toggles the native radio. Mode 0 uses
+    // received_data_events() which surfaces single-shot destination-encrypted
+    // packets (what send_to produces), so messages between BLE peers actually
+    // reach the JS event stream.
+    if (!isRunning) {
+      const ok = await start({
+        mode: LxmfNodeMode.BleOnly,
+        displayName: displayName.trim() || 'lxmf-mobile',
+      });
+      if (!ok) {
+        setTransportMsg('Failed to start node in BLE mode.');
+        return;
+      }
+    }
     startBLE();
     setBleActive(true);
-  }, [startBLE]);
+  }, [isRunning, start, startBLE, displayName]);
 
-  const onStopBle = useCallback(() => {
+  const onStopBle = useCallback(async () => {
     stopBLE();
     setBleActive(false);
     setUnpairedRNodes(0);
-  }, [stopBLE]);
+    if (isRunning) {
+      await stop();
+    }
+  }, [stopBLE, stop, isRunning]);
 
   // Poll for unpaired RNodes while BLE is active
   useEffect(() => {
@@ -362,7 +474,7 @@ export default function HomeScreen() {
         />
         {transportMsg ? <Text style={S.warn}>{transportMsg}</Text> : null}
         <View style={S.btnRow}>
-          <Btn label="Start TCP" onPress={onStartTcp} disabled={!isNativeAvailable || isRunning} />
+          <Btn label="Start TCP" onPress={onStartTcp} disabled={!isNativeAvailable || isRunning || !identityHydrated} />
           <Btn label="Stop TCP" onPress={onStopTcp} disabled={!isRunning} danger />
         </View>
       </Accordion>
@@ -378,7 +490,7 @@ export default function HomeScreen() {
           </Text>
         )}
         <View style={S.btnRow}>
-          <Btn label="Start BLE" onPress={onStartBle} disabled={bleActive} />
+          <Btn label="Start BLE" onPress={onStartBle} disabled={bleActive || !identityHydrated} />
           <Btn label="Stop BLE" onPress={onStopBle} disabled={!bleActive} danger />
         </View>
       </Accordion>

@@ -26,6 +26,9 @@ export type NativeModuleType = {
   send(destHex: string, bodyBase64: string): Promise<number>;
   broadcast(destsHex: string[], bodyBase64: string): Promise<number>;
 
+  // Identity (returns full 128-char private key hex for persistence; null if no node)
+  getIdentityHex(): string | null;
+
   // Status & State
   getStatus(): string | null;
   getBeacons(): string | null;
@@ -60,6 +63,7 @@ const missingNativeShim: NativeModuleType = {
   isRunning: () => false,
   send: async () => throwMissingNative(),
   broadcast: async () => throwMissingNative(),
+  getIdentityHex: () => throwMissingNative(),
   getStatus: () => throwMissingNative(),
   getBeacons: () => throwMissingNative(),
   fetchMessages: () => throwMissingNative(),
