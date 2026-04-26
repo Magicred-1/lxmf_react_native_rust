@@ -217,6 +217,7 @@ class LxmfModule : Module() {
   external fun nativeBleConnected(peerAddr: ByteArray)
   external fun nativeBleDisconnected(peerAddr: ByteArray)
   external fun nativeBlePeerCount(): Int
+  external fun nativeOnMtuNegotiated(peerAddr: ByteArray, attMtu: Int)
 
   companion object {
     @Volatile

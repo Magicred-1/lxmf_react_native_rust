@@ -16,15 +16,18 @@
 //!   HDLC( Reticulum_packet_bytes )
 //!
 //! HDLC flag = 0x7E, escape = 0x7D, same codec as `crate::framing::hdlc_encode`.
-//! MTU = 244 bytes — BLE 5.0 DLE maximum, safe on iOS.
 //!
-//! # Segmentation (for packets 245–500 bytes)
+//! Write limit is negotiated per-peer via ATT MTU exchange (target 247B = ATT_MTU 250 − 3,
+//! matching the lxmf-sdk MobileBleCapabilities::max_payload_bytes contract).
+//!
+//! # Segmentation (for packets that exceed the negotiated write limit)
 //!
 //! Each BLE characteristic write is prefixed with a 2-byte segment header:
 //!   [seg_idx: u8][total_segs: u8][payload...]
 //! Single-frame packets use header [0, 1]. Receiver reassembles before HDLC decode.
 //!
 //! Packets > BLE_MAX_PACKET (500 B) are dropped — use Reticulum Resources for large payloads.
+//! RX queue is capped at BLE_RX_QUEUE_MAX (64) frames; overflow drops newest arrivals.
 //!
 //! # GATT profile
 //!
@@ -114,9 +117,17 @@ pub fn peer_connected_notify() -> Arc<tokio::sync::Notify> {
 // ── JNI-callable entry points ─────────────────────────────────────────────────
 // These are called from Kotlin via JNI — no tokio context required.
 
+/// Maximum frames buffered from Kotlin before backpressure drops newest arrivals.
+/// Matches lxmf-sdk MobileBleCapabilities::max_notification_queue contract.
+const BLE_RX_QUEUE_MAX: usize = 64;
+
 /// Kotlin calls this when a BLE characteristic notification arrives from a peer.
 pub fn on_ble_rx(peer_addr: [u8; 6], data: Vec<u8>) {
     if let Ok(mut q) = ble_rx_queue().lock() {
+        if q.len() >= BLE_RX_QUEUE_MAX {
+            log::warn!("BleInterface: RX queue full ({} frames), dropping from {:02x?}", BLE_RX_QUEUE_MAX, peer_addr);
+            return;
+        }
         q.push_back(BleRxFrame { peer_addr, data });
     }
 }
@@ -183,7 +194,10 @@ fn peer_mtu(peer_addr: &[u8; 6]) -> usize {
         .lock()
         .ok()
         .and_then(|m| m.get(peer_addr).copied())
-        .unwrap_or(20) // ATT MTU 23B default − 3B header = 20B
+        // ATT_MTU 250 → 247B write payload (lxmf-sdk max_payload_bytes contract).
+        // MTU is always negotiated before on_ble_connected fires, so this only
+        // applies in error paths where negotiation was skipped entirely.
+        .unwrap_or(247)
 }
 
 // ── Segmentation ──────────────────────────────────────────────────────────────

@@ -111,6 +111,12 @@ func lxmf_ble_disconnected(
 @_silgen_name("lxmf_ble_peer_count")
 func lxmf_ble_peer_count() -> Int32
 
+@_silgen_name("lxmf_ble_mtu_negotiated")
+func lxmf_ble_mtu_negotiated(
+    _ peerAddr: UnsafePointer<UInt8>?,
+    _ writeLimit: UInt32
+) -> Int32
+
 // --- NUS Interface FFI (RNode BLE via Nordic UART Service) ---
 
 @_silgen_name("lxmf_nus_receive")
@@ -135,7 +141,11 @@ public class LxmfModule: Module {
     private var txDrainTimer: Timer?
 
     // BLE manager for phone-to-phone mesh
-    private lazy var bleManager = BLEManager()
+    private lazy var bleManager: BLEManager = {
+        let mgr = BLEManager()
+        mgr.onReadyToSend = { [weak self] in DispatchQueue.main.async { self?.drainOutgoing() } }
+        return mgr
+    }()
 
     public func definition() -> ModuleDefinition {
         Name("LxmfModule")
@@ -385,7 +395,8 @@ public class LxmfModule: Module {
 
             let frameData = Data(dataBuf[0..<Int(len)])
             let addr = Data(peerAddr)
-            bleManager.sendToPeerAddr(addr, data: frameData)
+            // Stop draining if CoreBluetooth buffer is full — onReadyToSend re-triggers us.
+            guard bleManager.sendToPeerAddr(addr, data: frameData) else { break }
         }
 
         // --- NUS: poll for KISS-framed RNode data ---

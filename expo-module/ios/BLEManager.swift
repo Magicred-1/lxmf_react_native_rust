@@ -53,6 +53,10 @@ class BLEManager: NSObject {
 
     private var isRunning = false
 
+    /// Called when CoreBluetooth signals it is ready to accept more writes.
+    /// LxmfModule sets this to re-trigger drainOutgoing() without a timer.
+    var onReadyToSend: (() -> Void)?
+
     /// Per-launch random token embedded in our advertisement's local name, so
     /// our central role can detect and skip our own peripheral advertisement
     /// (CoreBluetooth does not auto-filter self when running both roles).
@@ -176,20 +180,30 @@ class BLEManager: NSObject {
     }
 
     /// Send data to a specific peer by 6-byte pseudo-MAC address.
-    /// Used by drainOutgoing() to route frames from lxmf_ble_poll_tx.
-    func sendToPeerAddr(_ addr: Data, data: Data) {
-        // Try peripheral role: send notification to a subscribed central
+    /// Returns false when CoreBluetooth's TX buffer is full — caller should stop
+    /// draining and wait for onReadyToSend before resuming.
+    @discardableResult
+    func sendToPeerAddr(_ addr: Data, data: Data) -> Bool {
+        // Peripheral role: push notification to subscribed central.
+        // updateValue returns false when the subscriber's buffer is full;
+        // peripheralManagerIsReady(toUpdateSubscribers:) fires when it drains.
         if let central = addrToCentral[addr], let txChar = txCharacteristic {
-            peripheralManager?.updateValue(data, for: txChar, onSubscribedCentrals: [central])
-            return
+            let ok = peripheralManager?.updateValue(data, for: txChar, onSubscribedCentrals: [central]) ?? false
+            return ok
         }
 
-        // Try central role: write to connected peripheral's RX characteristic
+        // Central role: write to peer's RX characteristic.
+        // canSendWriteWithoutResponse goes false when the internal queue is full;
+        // peripheral(_:isReadyToSendWriteWithoutResponse:) fires when it drains.
         if let peripheralUUID = addrToPeripheralUUID[addr],
            let peripheral = connectedPeripherals[peripheralUUID],
            let char = txCharacteristics[peripheralUUID] {
+            guard peripheral.canSendWriteWithoutResponse else { return false }
             peripheral.writeValue(data, for: char, type: .withoutResponse)
+            return true
         }
+
+        return true // peer not found — frame consumed, no retry needed
     }
 
     /// Write KISS-framed data to all connected RNodes via NUS TX characteristic.
@@ -427,6 +441,11 @@ extension BLEManager: CBPeripheralDelegate {
         addr.withUnsafeBytes { ptr in
             _ = lxmf_ble_connected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
         }
+        // Report negotiated write limit so Rust segments correctly for this peer.
+        let writeLimit = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        addr.withUnsafeBytes { ptr in
+            _ = lxmf_ble_mtu_negotiated(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(writeLimit))
+        }
 
         for char in chars {
             if char.uuid == BLEManager.rxCharUUID {
@@ -465,6 +484,12 @@ extension BLEManager: CBPeripheralDelegate {
                 )
             }
         }
+    }
+
+    // Called when writeValue(.withoutResponse) exhausted the internal queue.
+    // Re-trigger TX drain so buffered frames get sent now that there's room.
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        onReadyToSend?()
     }
 }
 
@@ -513,6 +538,11 @@ extension BLEManager: CBPeripheralManagerDelegate {
             addr.withUnsafeBytes { ptr in
                 _ = lxmf_ble_connected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
             }
+            // Report negotiated notification limit for this central.
+            let writeLimit = central.maximumUpdateValueLength
+            addr.withUnsafeBytes { ptr in
+                _ = lxmf_ble_mtu_negotiated(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(writeLimit))
+            }
         }
     }
 
@@ -525,6 +555,11 @@ extension BLEManager: CBPeripheralManagerDelegate {
         addr.withUnsafeBytes { ptr in
             _ = lxmf_ble_disconnected(ptr.baseAddress?.assumingMemoryBound(to: UInt8.self))
         }
+    }
+
+    // Called when updateValue returned false and the subscriber buffer has drained.
+    func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        onReadyToSend?()
     }
 
     // Background restoration

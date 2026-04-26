@@ -53,6 +53,7 @@ class BleManager(
     private var advertiser: BluetoothLeAdvertiser? = null
     private var isScanning = false
     private var isAdvertising = false
+    private var isRunning = false
 
     // GATT server (peripheral role) — accepts inbound writes from remote centrals
     // and pushes outbound notifications to subscribed centrals.
@@ -61,6 +62,8 @@ class BleManager(
     // Centrals that have enabled CCC notifications on our TX char, keyed by MAC.
     // Only these are "registered as peers" with Rust (mirrors iOS subscribedCentrals).
     private val serverSubscribers = mutableMapOf<String, BluetoothDevice>()
+    // Buffer for ATT Long Write (preparedWrite=true) fragments from remote centrals.
+    private val preparedWriteBuffer = mutableMapOf<String, java.io.ByteArrayOutputStream>()
 
     // TX polling — every 50 ms drain the Rust TX queue and write to peers
     private val txPollRunnable = object : Runnable {
@@ -80,20 +83,29 @@ class BleManager(
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     fun start() {
+        if (isRunning) {
+            Log.d(TAG, "BleManager already running — skipping duplicate start()")
+            return
+        }
         if (adapter == null || !adapter!!.isEnabled) {
             Log.w(TAG, "Bluetooth not available or not enabled")
             return
         }
+        isRunning = true
         // GATT server must be opened (and service added) before advertising,
         // otherwise centrals connect and find no service. startAdvertising()
         // is invoked from onServiceAdded once the service is registered.
         openGattServer()
         startScanning()
+        // Remove any stale callbacks before scheduling — guards against duplicate
+        // poll loops if start() is somehow called more than once.
+        mainHandler.removeCallbacks(txPollRunnable)
         mainHandler.postDelayed(txPollRunnable, TX_POLL_INTERVAL_MS)
         Log.i(TAG, "BleManager started")
     }
 
     fun stop() {
+        isRunning = false
         stopScanning()
         stopAdvertising()
         closeGattServer()
@@ -258,14 +270,36 @@ class BleManager(
             value: ByteArray?,
         ) {
             if (characteristic.uuid == RNS_RX_CHAR_UUID && value != null && value.isNotEmpty()) {
-                // Inbound LXMF frame from a remote central. Push raw bytes to
-                // Rust — HDLC deframing happens there. 4KB cap enforced in FFI.
-                Log.d(TAG, "GATT server RX ${value.size}B from ${device.address}")
-                module.nativeBleReceive(macToBytes(device.address), value)
+                if (preparedWrite) {
+                    // ATT Long Write fragment — buffer until onExecuteWrite.
+                    preparedWriteBuffer.getOrPut(device.address) { java.io.ByteArrayOutputStream() }
+                        .write(value)
+                } else {
+                    Log.d(TAG, "GATT server RX ${value.size}B from ${device.address}")
+                    module.nativeBleReceive(macToBytes(device.address), value)
+                }
             }
             if (responseNeeded) {
-                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
+                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
             }
+        }
+
+        override fun onExecuteWrite(device: BluetoothDevice, requestId: Int, execute: Boolean) {
+            if (execute) {
+                preparedWriteBuffer.remove(device.address)?.let { buf ->
+                    val data = buf.toByteArray()
+                    Log.d(TAG, "GATT server RX (assembled) ${data.size}B from ${device.address}")
+                    module.nativeBleReceive(macToBytes(device.address), data)
+                }
+            } else {
+                preparedWriteBuffer.remove(device.address)
+            }
+            gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+        }
+
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            Log.i(TAG, "GATT server MTU changed: ${device.address} -> ${mtu}B")
+            module.nativeOnMtuNegotiated(macToBytes(device.address), mtu)
         }
 
         override fun onDescriptorWriteRequest(
@@ -407,34 +441,68 @@ class BleManager(
                 gatt.disconnect()
                 return
             }
-            // Subscribe to peer's TX char (their notify path → our inbound).
-            // Convention matches iOS BLEManager.swift: RX is write-only on the
-            // peripheral, TX is notify-only. Subscribing to RX is a no-op.
-            val peerTxChar = service.getCharacteristic(RNS_TX_CHAR_UUID)
-            if (peerTxChar != null) {
-                gatt.setCharacteristicNotification(peerTxChar, true)
-                val cccd = peerTxChar.getDescriptor(CCCD_UUID)
-                cccd?.let {
-                    @Suppress("DEPRECATION")
-                    it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    @Suppress("DEPRECATION")
-                    gatt.writeDescriptor(it)
-                }
-            }
-            // Notify Rust of new peer
-            module.nativeBleConnected(macToBytes(gatt.device.address))
-            Log.i(TAG, "BLE peer ready: ${gatt.device.address}")
+            // Request large MTU before enabling notifications so writes fit in one ATT PDU.
+            Log.i(TAG, "BLE services discovered: ${gatt.device.address}, requesting MTU")
+            gatt.requestMtu(517)
         }
 
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            val mac = gatt.device.address
+            val effectiveMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23
+            Log.i(TAG, "BLE MTU negotiated: $mac -> ${effectiveMtu}B")
+            module.nativeOnMtuNegotiated(macToBytes(mac), effectiveMtu)
+            // Subscribe to peer's TX notifications; nativeBleConnected fires in onDescriptorWrite
+            // after the CCCD write completes — writing before then returns ok=false.
+            val service = gatt.getService(RNS_SERVICE_UUID) ?: return
+            val peerTxChar = service.getCharacteristic(RNS_TX_CHAR_UUID) ?: return
+            gatt.setCharacteristicNotification(peerTxChar, true)
+            val cccd = peerTxChar.getDescriptor(CCCD_UUID) ?: return
+            @Suppress("DEPRECATION")
+            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            @Suppress("DEPRECATION")
+            gatt.writeDescriptor(cccd)
+        }
+
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            val mac = gatt.device.address
+            if (descriptor.uuid == CCCD_UUID && descriptor.characteristic?.uuid == RNS_TX_CHAR_UUID) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    // GATT setup complete — subscribed to peer TX notifications, safe to write now.
+                    Log.i(TAG, "BLE peer ready (client): $mac")
+                    module.nativeBleConnected(macToBytes(mac))
+                } else {
+                    // CCCD write failed — can't subscribe to their notifications from client role,
+                    // but if they already connected to our server and subscribed, the server-side
+                    // path handles full duplex. Don't disconnect — keep the connection open.
+                    Log.w(TAG, "BLE CCCD write failed ($status) on $mac — continuing via server role if available")
+                }
+            }
+        }
+
+        // API 33+: platform delivers value directly — characteristic.value is null here.
+        @Suppress("OVERRIDE_DEPRECATION")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
         ) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
             if (characteristic.uuid == RNS_TX_CHAR_UUID) {
                 @Suppress("DEPRECATION")
                 val data = characteristic.value ?: return
-                Log.d(TAG, "BLE RX ${data.size}B from ${gatt.device.address}")
+                Log.d(TAG, "BLE RX(compat) ${data.size}B from ${gatt.device.address}")
                 module.nativeBleReceive(macToBytes(gatt.device.address), data)
+            }
+        }
+
+        @androidx.annotation.RequiresApi(Build.VERSION_CODES.TIRAMISU)
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+        ) {
+            if (characteristic.uuid == RNS_TX_CHAR_UUID) {
+                Log.d(TAG, "BLE RX ${value.size}B from ${gatt.device.address}")
+                module.nativeBleReceive(macToBytes(gatt.device.address), value)
             }
         }
 
@@ -451,41 +519,42 @@ class BleManager(
 
     // ── TX drain — poll Rust and write to peer characteristics ───────────────
 
+    // Android GATT is single-op: concurrent writeCharacteristic() calls return
+    // false and drop the packet. Send one frame per 50ms poll tick instead of
+    // draining all pending frames at once.
     private fun drainTxQueue() {
-        while (true) {
-            val json = module.nativeBlePollTx() ?: break
-            try {
-                val obj = org.json.JSONObject(json)
-                val peerHex = obj.getString("peer")           // "aabbccddeeff"
-                val dataB64 = obj.getString("data")
-                val data = android.util.Base64.decode(dataB64, android.util.Base64.DEFAULT)
-                val mac = hexToMacString(peerHex)             // "AA:BB:CC:DD:EE:FF"
+        val json = module.nativeBlePollTx() ?: return
+        try {
+            val obj = org.json.JSONObject(json)
+            val peerHex = obj.getString("peer")           // "aabbccddeeff"
+            val dataB64 = obj.getString("data")
+            val data = android.util.Base64.decode(dataB64, android.util.Base64.DEFAULT)
+            val mac = hexToMacString(peerHex)             // "AA:BB:CC:DD:EE:FF"
 
-                // Peripheral (server) role: peer subscribed to our TX char →
-                // push via NOTIFY. Mirrors iOS peripheralManager.updateValue.
-                val subscriber = serverSubscribers[mac]
-                val txChar = serverTxChar
-                if (subscriber != null && txChar != null) {
-                    val ok = notifyServerSubscriber(subscriber, txChar, data)
-                    Log.d(TAG, "BLE NOTIFY ${data.size}B to $mac ok=$ok")
-                    continue
-                }
-
-                // Central (client) role: write to peer's RX characteristic.
-                // RX has WRITE properties; TX is notify-only (writes there
-                // would be rejected by the peer). Matches iOS convention.
-                val gatt = connections[mac] ?: continue
-                val service = gatt.getService(RNS_SERVICE_UUID) ?: continue
-                val peerRxChar = service.getCharacteristic(RNS_RX_CHAR_UUID) ?: continue
-                @Suppress("DEPRECATION")
-                peerRxChar.value = data
-                peerRxChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                @Suppress("DEPRECATION")
-                val ok = gatt.writeCharacteristic(peerRxChar)
-                Log.d(TAG, "BLE TX ${data.size}B to $mac ok=$ok")
-            } catch (e: Exception) {
-                Log.e(TAG, "drainTxQueue parse error: ${e.message}")
+            // Peripheral (server) role: peer subscribed to our TX char →
+            // push via NOTIFY. Mirrors iOS peripheralManager.updateValue.
+            val subscriber = serverSubscribers[mac]
+            val txChar = serverTxChar
+            if (subscriber != null && txChar != null) {
+                val ok = notifyServerSubscriber(subscriber, txChar, data)
+                Log.d(TAG, "BLE NOTIFY ${data.size}B to $mac ok=$ok")
+                return
             }
+
+            // Central (client) role: write to peer's RX characteristic.
+            // RX has WRITE properties; TX is notify-only (writes there
+            // would be rejected by the peer). Matches iOS convention.
+            val gatt = connections[mac] ?: return
+            val service = gatt.getService(RNS_SERVICE_UUID) ?: return
+            val peerRxChar = service.getCharacteristic(RNS_RX_CHAR_UUID) ?: return
+            @Suppress("DEPRECATION")
+            peerRxChar.value = data
+            peerRxChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            @Suppress("DEPRECATION")
+            val ok = gatt.writeCharacteristic(peerRxChar)
+            Log.d(TAG, "BLE TX ${data.size}B to $mac ok=$ok")
+        } catch (e: Exception) {
+            Log.e(TAG, "drainTxQueue parse error: ${e.message}")
         }
     }
 

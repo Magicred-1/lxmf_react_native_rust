@@ -11,7 +11,7 @@ import {
   View,
 } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
-import { LxmfNodeMode, type LxmfEvent, useLxmf } from '@magicred-1/react-native-lxmf';
+import { LxmfModule, LxmfNodeMode, type LxmfEvent, useLxmf } from '@magicred-1/react-native-lxmf';
 
 // Persisted identity blob schema (versioned). Stored in expo-secure-store under
 // IDENTITY_KEY — encrypted at rest on iOS (Keychain) and Android (Keystore-backed).
@@ -215,6 +215,7 @@ export default function HomeScreen() {
   const [sendResult, setSendResult] = useState('');
 
   const [unpairedRNodes, setUnpairedRNodes] = useState(0);
+  const [liveBleCount, setLiveBleCount] = useState(0);
 
   // Identity hydration: read once from secure store on mount. Until hydrated,
   // we pass 'new' so Rust generates a fresh identity (which we'll then persist
@@ -305,7 +306,21 @@ export default function HomeScreen() {
 
   const announceEvts = useMemo(() => events.filter(e => e.type === 'announceReceived').slice(0, 20), [events]);
   const msgEvts = useMemo(() => events.filter(e => e.type === 'messageReceived').slice(0, 20), [events]);
-  const logEvts = useMemo(() => events.filter(e => e.type === 'log').slice(0, 30), [events]);
+  const logEvts = useMemo(() => events.filter(e => e.type === 'log').slice(0, 100), [events]);
+
+  // Deduped peer identity hashes from all announce events (any interface)
+  const knownPeerHashes = useMemo(() => {
+    const map = new Map<string, { hash: string; name: string; lastSeen: string }>();
+    for (const e of events) {
+      if (e.type !== 'announceReceived') continue;
+      const hash = String(e.destHash ?? e.address ?? '');
+      if (!hash) continue;
+      if (!map.has(hash)) {
+        map.set(hash, { hash, name: e.appData ? String(e.appData) : '', lastSeen: fmtTime(e) });
+      }
+    }
+    return Array.from(map.values());
+  }, [events]);
   const allEvts = useMemo(() => events.slice(0, 30), [events]);
 
   // ── Actions ───────────────────────────────────────────────────────────────
@@ -317,17 +332,23 @@ export default function HomeScreen() {
     if (!host) { setTransportMsg('Host required.'); return; }
     if (!Number.isInteger(port) || port < 1 || port > 65535) { setTransportMsg('Port 1–65535.'); return; }
     const ok = await start({
-      mode: LxmfNodeMode.Reticulum,
+      mode: LxmfNodeMode.ReticulumAndBle,
       tcpInterfaces: [{ host, port }],
       displayName: displayName.trim() || 'lxmf-mobile',
     });
-    if (ok) setTcpActive(true);
-  }, [tcpHost, tcpPort, displayName, start]);
+    if (ok) {
+      setTcpActive(true);
+      startBLE();
+      setBleActive(true);
+    }
+  }, [tcpHost, tcpPort, displayName, start, startBLE]);
 
   const onStopTcp = useCallback(async () => {
+    stopBLE();
     await stop();
     setTcpActive(false);
-  }, [stop]);
+    setBleActive(false);
+  }, [stop, stopBLE]);
 
   const onStartBle = useCallback(async () => {
     setTransportMsg('');
@@ -346,24 +367,27 @@ export default function HomeScreen() {
         return;
       }
     }
-    // Start LxmfNode in BLE-only mode (mode 0). Without this the node never
-    // initializes — Start BLE alone only toggles the native radio. Mode 0 uses
-    // received_data_events() which surfaces single-shot destination-encrypted
-    // packets (what send_to produces), so messages between BLE peers actually
-    // reach the JS event stream.
+    // If node already running (started via TCP), just enable BLE hardware.
+    // Otherwise start mode 4 (TCP+BLE) using the configured TCP host/port.
     if (!isRunning) {
+      const host = tcpHost.trim();
+      const port = Number(tcpPort);
+      if (!host) { setTransportMsg('Host required for TCP+BLE mode.'); return; }
+      if (!Number.isInteger(port) || port < 1 || port > 65535) { setTransportMsg('Port 1–65535.'); return; }
       const ok = await start({
-        mode: LxmfNodeMode.BleOnly,
+        mode: LxmfNodeMode.ReticulumAndBle,
+        tcpInterfaces: [{ host, port }],
         displayName: displayName.trim() || 'lxmf-mobile',
       });
       if (!ok) {
-        setTransportMsg('Failed to start node in BLE mode.');
+        setTransportMsg('Failed to start node.');
         return;
       }
+      setTcpActive(true);
     }
     startBLE();
     setBleActive(true);
-  }, [isRunning, start, startBLE, displayName]);
+  }, [isRunning, tcpHost, tcpPort, start, startBLE, displayName]);
 
   const onStopBle = useCallback(async () => {
     stopBLE();
@@ -382,6 +406,15 @@ export default function HomeScreen() {
     }, 2000);
     return () => clearInterval(id);
   }, [bleActive, bleUnpairedRNodeCount]);
+
+  // Live BLE peer count — poll every second
+  useEffect(() => {
+    if (!bleActive) { setLiveBleCount(0); return; }
+    const tick = () => { try { setLiveBleCount(LxmfModule.blePeerCount()); } catch {} };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [bleActive]);
 
   const onSend = useCallback(async () => {
     const d = dest.trim().toLowerCase();
@@ -483,7 +516,7 @@ export default function HomeScreen() {
       <Accordion title="BLE Mesh" defaultOpen>
         <Text style={S.hint}>Pair RNodes in iOS Settings &gt; Bluetooth first, then start BLE.</Text>
         <Row label="BLE active" value={bleActive ? 'Yes' : 'No'} />
-        <Row label="BLE peers" value={String(status?.blePeerCount ?? 0)} />
+        <Row label="Connected peers" value={String(liveBleCount)} />
         {unpairedRNodes > 0 && (
           <Text style={S.warn}>
             Found {unpairedRNodes} unpaired RNode{unpairedRNodes > 1 ? 's' : ''}. Open Settings &gt; Bluetooth, pair the device, then restart BLE.
@@ -495,15 +528,27 @@ export default function HomeScreen() {
         </View>
       </Accordion>
 
-      {/* ── Peers / Beacons ──────────────────────────────────────────────── */}
-      <Accordion title="Peers / Beacons" badge={beacons.length} defaultOpen={false}>
-        {beacons.length === 0 ? (
-          <Text style={S.muted}>No peers yet.</Text>
+      {/* ── BLE Peers ────────────────────────────────────────────────────── */}
+      <Accordion title="BLE Peers" badge={liveBleCount} defaultOpen>
+        <Text style={S.hint}>
+          Live BLE connections: {liveBleCount}. LXMF identity hashes appear after peer announces.
+        </Text>
+        {knownPeerHashes.length === 0 ? (
+          <Text style={S.muted}>No peer announces received yet.</Text>
         ) : (
-          beacons.map((b, i) => (
-            <View key={`${b.destHash}-${i}`} style={S.itemCard}>
-              <Text selectable style={S.itemTitle}>{shortHex(b.destHash)}</Text>
-              <Text style={S.itemMeta}>state: {b.state} · reconnects: {b.reconnectAttempts}</Text>
+          knownPeerHashes.map((p) => (
+            <View key={p.hash} style={S.itemCard}>
+              {p.name ? <Text style={S.itemTitle}>{p.name}</Text> : null}
+              <Text selectable style={S.itemBody}>{p.hash}</Text>
+              <Text style={S.itemMeta}>last seen: {p.lastSeen}</Text>
+              <View style={S.announceActions}>
+                <Pressable style={S.copyBtn} onPress={() => copyToClipboard(p.hash)}>
+                  <Text style={S.copyBtnText}>⎘</Text>
+                </Pressable>
+                <Pressable style={S.sendToBtn} onPress={() => { setDest(p.hash); setSendResult(''); }}>
+                  <Text style={S.sendToBtnText}>→ Send</Text>
+                </Pressable>
+              </View>
             </View>
           ))
         )}
@@ -628,14 +673,15 @@ export default function HomeScreen() {
       </Accordion>
 
       {/* ── Debug Logs ───────────────────────────────────────────────────── */}
-      <Accordion title="Debug Logs" badge={counts.logs} defaultOpen={false}>
+      <Accordion title="Debug Logs" badge={counts.logs} defaultOpen>
         {logEvts.length === 0 ? (
           <Text style={S.muted}>No logs yet.</Text>
         ) : (
           logEvts.map((e, i) => (
-            <Text key={`${evtKey(e, 'lg-')}-${i}`} selectable style={S.logLine} numberOfLines={3}>
-              [{fmtTime(e)}] {evtSummary(e)}
-            </Text>
+            <View key={`${evtKey(e, 'lg-')}-${i}`} style={S.logRow}>
+              <Text style={S.logTime}>{fmtTime(e)}</Text>
+              <Text selectable style={S.logLine}>{String(e.message ?? e.msg ?? evtSummary(e))}</Text>
+            </View>
           ))
         )}
       </Accordion>

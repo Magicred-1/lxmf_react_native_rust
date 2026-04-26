@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
-    "@magicred-1/react-native-lxmf": "file:../expo-module",
+    "@magicred-1/react-native-lxmf": "file:..",
     "@react-native/virtualized-lists": "0.81.5",
     "@react-navigation/bottom-tabs": "^7.4.0",
     "@react-navigation/elements": "^2.6.3",

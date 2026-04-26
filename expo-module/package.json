@@ -1,6 +1,6 @@
 {
   "name": "@magicred-1/react-native-lxmf",
-  "version": "0.1.9",
+  "version": "0.2.1",
   "description": "LXMF Reticulum mesh networking for React Native + Expo",
   "main": "build/index.js",
   "types": "build/index.d.ts",
@@ -73,6 +73,19 @@
     "LxmfReactNative.podspec",
     "expo-module.config.json",
     "app.plugin.js",
-    "README.md"
+    "README.md",
+    "example/app",
+    "example/assets",
+    "example/components",
+    "example/constants",
+    "example/hooks",
+    "example/scripts",
+    "example/app.json",
+    "example/package.json",
+    "example/metro.config.js",
+    "example/tsconfig.json",
+    "example/expo-env.d.ts",
+    "example/eslint.config.js",
+    "example/README.md"
   ]
 }

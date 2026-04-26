@@ -2,22 +2,23 @@ const { getDefaultConfig } = require('expo/metro-config');
 const path = require('node:path');
 
 const projectRoot = __dirname;
-const workspaceRoot = path.resolve(projectRoot, '..');
+const moduleRoot = path.resolve(projectRoot, '..');   // expo-module/
+const workspaceRoot = path.resolve(projectRoot, '../..'); // repo root
 const config = getDefaultConfig(projectRoot);
 
 // Minimize watchers
 config.maxWorkers = 1;
 config.watchFolders = [
   projectRoot,
-  // Include local file: dependency target so Metro can resolve symlinked package sources
-  path.resolve(projectRoot, '../expo-module'),
+  // Include the parent expo-module so Metro resolves local file: dependency
+  moduleRoot,
 ];
 
 // Blacklist huge directories and duplicate react-native copies
 const blockList = [
   /node_modules\/react-native\/ReactAndroid/,
   /node_modules\/react-native\/ReactApple/,
-  // Prevent expo-module's local react-native from shadowing the app's copy
+  // Prevent parent expo-module's react-native from shadowing the example's copy
   /expo-module\/node_modules\/react-native\//,
   /expo-module\/node_modules\/react\//,
 ];
