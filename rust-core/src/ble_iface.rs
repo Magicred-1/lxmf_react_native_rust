@@ -165,6 +165,27 @@ pub fn clear_ble_peers() {
     }
 }
 
+fn ble_peer_mtu() -> Arc<Mutex<HashMap<[u8; 6], usize>>> {
+    static M: OnceLock<Arc<Mutex<HashMap<[u8; 6], usize>>>> = OnceLock::new();
+    M.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))).clone()
+}
+
+/// Called from JNI after Kotlin's onMtuChanged. `char_write_limit` = ATT MTU − 3.
+pub fn on_mtu_negotiated(peer_addr: [u8; 6], char_write_limit: usize) {
+    if let Ok(mut map) = ble_peer_mtu().lock() {
+        map.insert(peer_addr, char_write_limit);
+        log::info!("BleInterface: peer {:02x?} write limit={}B", peer_addr, char_write_limit);
+    }
+}
+
+fn peer_mtu(peer_addr: &[u8; 6]) -> usize {
+    ble_peer_mtu()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(peer_addr).copied())
+        .unwrap_or(20) // ATT MTU 23B default − 3B header = 20B
+}
+
 // ── Segmentation ──────────────────────────────────────────────────────────────
 
 /// Encode `data` into one or more BLE-MTU-sized frames, each with a 2-byte segment header.
@@ -184,6 +205,29 @@ pub fn segment(data: &[u8]) -> Vec<Vec<u8>> {
     let total_segs = (data.len() + SEG_PAYLOAD - 1) / SEG_PAYLOAD;
     debug_assert!(total_segs <= 255, "packet too large even for segmentation");
     data.chunks(SEG_PAYLOAD)
+        .enumerate()
+        .map(|(idx, chunk)| {
+            let mut frame = Vec::with_capacity(SEG_HEADER + chunk.len());
+            frame.push(idx as u8);
+            frame.push(total_segs as u8);
+            frame.extend_from_slice(chunk);
+            frame
+        })
+        .collect()
+}
+
+/// Encode `data` into BLE segments using `seg_payload` bytes per segment payload.
+pub fn segment_with_payload(data: &[u8], seg_payload: usize) -> Vec<Vec<u8>> {
+    if data.len() <= seg_payload {
+        let mut frame = Vec::with_capacity(SEG_HEADER + data.len());
+        frame.push(0u8);
+        frame.push(1u8);
+        frame.extend_from_slice(data);
+        return vec![frame];
+    }
+    let total_segs = (data.len() + seg_payload - 1) / seg_payload;
+    debug_assert!(total_segs <= 255, "packet too large even for segmentation");
+    data.chunks(seg_payload)
         .enumerate()
         .map(|(idx, chunk)| {
             let mut frame = Vec::with_capacity(SEG_HEADER + chunk.len());
@@ -371,9 +415,6 @@ impl BleInterface {
                         // HDLC encode.
                         let hdlc_frame = hdlc_encode(serialized);
 
-                        // Segment into BLE-MTU-sized writes.
-                        let segments = segment(&hdlc_frame);
-
                         // Get current peer list.
                         let peer_addrs: Vec<[u8; 6]> = peers_arc
                             .lock()
@@ -385,17 +426,19 @@ impl BleInterface {
                             continue;
                         }
 
-                        // Enqueue one set of segments per peer.
+                        // Segment per-peer using negotiated write limit.
                         if let Ok(mut tx_q) = tx_queue.lock() {
                             for peer in &peer_addrs {
-                                for seg in &segments {
+                                let write_limit = peer_mtu(peer);
+                                let seg_payload = write_limit.saturating_sub(SEG_HEADER).max(1);
+                                for seg in segment_with_payload(&hdlc_frame, seg_payload) {
                                     log::debug!(
-                                        "BleInterface: TX seg {}B to {:02x?}",
-                                        seg.len(), peer
+                                        "BleInterface: TX seg {}B to {:02x?} (limit={}B)",
+                                        seg.len(), peer, write_limit
                                     );
                                     tx_q.push_back(BleTxFrame {
                                         peer_addr: *peer,
-                                        data: seg.clone(),
+                                        data: seg,
                                     });
                                 }
                             }

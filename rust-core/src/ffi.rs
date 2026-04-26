@@ -350,6 +350,21 @@ pub extern "C" fn lxmf_ble_peer_count() -> i32 {
     crate::ble_iface::ble_peer_count() as i32
 }
 
+/// Notify Rust of the negotiated BLE write limit for a peer.
+///
+/// `peer_addr`   — pointer to 6-byte peer address.
+/// `write_limit` — maximum characteristic write payload in bytes (iOS:
+///                 `maximumWriteValueLength(for: .withoutResponse)` or
+///                 `central.maximumUpdateValueLength`; Android: ATT MTU − 3).
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_ble_mtu_negotiated(peer_addr: *const u8, write_limit: u32) -> i32 {
+    if peer_addr.is_null() { return STATUS_ERR; }
+    let mut addr = [0u8; 6];
+    addr.copy_from_slice(slice::from_raw_parts(peer_addr, 6));
+    crate::ble_iface::on_mtu_negotiated(addr, write_limit as usize);
+    STATUS_OK
+}
+
 // --- NUS Interface (RNode BLE via Nordic UART Service) ---
 //
 // Swift calls these for RNode connectivity. Data is KISS-framed

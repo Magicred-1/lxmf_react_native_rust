@@ -414,3 +414,19 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBlePeerCount(
 ) -> jint {
     ble_iface::ble_peer_count() as jint
 }
+
+/// Called by Kotlin after ATT MTU negotiation completes for a peer.
+/// `att_mtu` is the raw value from onMtuChanged (includes 3-byte ATT header).
+/// Stores `att_mtu - 3` as the per-peer characteristic write limit.
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeOnMtuNegotiated(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_addr: JByteArray,
+    att_mtu: jint,
+) {
+    if let Some(mac) = jbytes_to_mac(&mut env, &peer_addr) {
+        let char_write_limit = (att_mtu as usize).saturating_sub(3).max(20);
+        ble_iface::on_mtu_negotiated(mac, char_write_limit);
+    }
+}
