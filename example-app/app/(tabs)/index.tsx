@@ -226,14 +226,19 @@ export default function HomeScreen() {
     (async () => {
       try {
         const raw = await SecureStore.getItemAsync(IDENTITY_KEY);
+        // TODO(sentinel): remove debug logs before merge — lengths/booleans only, no key material
+        console.log('[persist] hydrate', { hasRaw: !!raw, rawLen: raw?.length ?? 0 });
         if (cancelled) return;
         if (raw) {
           const parsed = JSON.parse(raw);
-          if (isValidIdentity(parsed)) {
+          const valid = isValidIdentity(parsed);
+          console.log('[persist] parsed', { valid, hasIdHex: typeof parsed?.identity_hex === 'string', hasAddrHex: typeof parsed?.address_hex === 'string' });
+          if (valid) {
             setStoredIdentity(parsed);
           }
         }
-      } catch {
+      } catch (e: any) {
+        console.log('[persist] hydrate FAIL', e?.message ?? 'unknown');
         // Corrupt blob or storage error — fall through; we'll generate fresh.
       } finally {
         if (!cancelled) setIdentityHydrated(true);
@@ -258,6 +263,12 @@ export default function HomeScreen() {
     if (!isRunning) return;
     const idHex = getIdentityHex();
     const addrHex = status?.addressHex;
+    // TODO(sentinel): remove debug logs before merge — lengths/booleans only, no key material
+    console.log('[persist] save check', {
+      idHexLen: idHex?.length ?? 0,
+      addrHexLen: addrHex?.length ?? 0,
+      alreadyStoredSame: storedIdentity?.identity_hex === idHex && storedIdentity?.address_hex === addrHex,
+    });
     if (!idHex || idHex.length !== 128) return;
     if (!addrHex || !/^[0-9a-fA-F]{32}$/.test(addrHex)) return;
     if (storedIdentity?.identity_hex === idHex && storedIdentity?.address_hex === addrHex) return;
@@ -269,8 +280,14 @@ export default function HomeScreen() {
       created_at: new Date().toISOString(),
     };
     SecureStore.setItemAsync(IDENTITY_KEY, JSON.stringify(blob))
-      .then(() => setStoredIdentity(blob))
-      .catch(() => { /* persistence failure is non-fatal for the running session */ });
+      .then(() => {
+        console.log('[persist] save OK');
+        setStoredIdentity(blob);
+      })
+      .catch((e: any) => {
+        console.log('[persist] save FAIL', e?.message ?? 'unknown');
+        /* persistence failure is non-fatal for the running session */
+      });
   }, [isRunning, status?.addressHex, storedIdentity, getIdentityHex]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
@@ -313,6 +330,7 @@ export default function HomeScreen() {
   }, [stop]);
 
   const onStartBle = useCallback(async () => {
+    setTransportMsg('');
     if (Platform.OS === 'android') {
       const perms = Platform.Version >= 31
         ? [
@@ -328,15 +346,33 @@ export default function HomeScreen() {
         return;
       }
     }
+    // Start LxmfNode in BLE-only mode (mode 0). Without this the node never
+    // initializes — Start BLE alone only toggles the native radio. Mode 0 uses
+    // received_data_events() which surfaces single-shot destination-encrypted
+    // packets (what send_to produces), so messages between BLE peers actually
+    // reach the JS event stream.
+    if (!isRunning) {
+      const ok = await start({
+        mode: LxmfNodeMode.BleOnly,
+        displayName: displayName.trim() || 'lxmf-mobile',
+      });
+      if (!ok) {
+        setTransportMsg('Failed to start node in BLE mode.');
+        return;
+      }
+    }
     startBLE();
     setBleActive(true);
-  }, [startBLE]);
+  }, [isRunning, start, startBLE, displayName]);
 
-  const onStopBle = useCallback(() => {
+  const onStopBle = useCallback(async () => {
     stopBLE();
     setBleActive(false);
     setUnpairedRNodes(0);
-  }, [stopBLE]);
+    if (isRunning) {
+      await stop();
+    }
+  }, [stopBLE, stop, isRunning]);
 
   // Poll for unpaired RNodes while BLE is active
   useEffect(() => {
