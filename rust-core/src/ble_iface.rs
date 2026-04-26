@@ -98,6 +98,19 @@ fn ble_peers() -> Arc<Mutex<Vec<[u8; 6]>>> {
     P.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone()
 }
 
+/// Notifier fired whenever a new BLE peer completes GATT connect.
+/// The node task awaits this to trigger an immediate re-announce, so
+/// peers don't have to wait for the 5s periodic timer after first connect.
+fn ble_peer_connected_notify() -> Arc<tokio::sync::Notify> {
+    static N: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+    N.get_or_init(|| Arc::new(tokio::sync::Notify::new())).clone()
+}
+
+/// Public accessor for the node task to await peer-connect events.
+pub fn peer_connected_notify() -> Arc<tokio::sync::Notify> {
+    ble_peer_connected_notify()
+}
+
 // ── JNI-callable entry points ─────────────────────────────────────────────────
 // These are called from Kotlin via JNI — no tokio context required.
 
@@ -116,11 +129,16 @@ pub fn next_ble_tx() -> Option<BleTxFrame> {
 
 /// Kotlin calls this when a GATT connection is established with a remote peer.
 pub fn on_ble_connected(peer_addr: [u8; 6]) {
+    let mut newly_added = false;
     if let Ok(mut peers) = ble_peers().lock() {
         if !peers.contains(&peer_addr) {
             peers.push(peer_addr);
             log::info!("BleInterface: peer connected {:02x?}", peer_addr);
+            newly_added = true;
         }
+    }
+    if newly_added {
+        ble_peer_connected_notify().notify_waiters();
     }
 }
 
