@@ -9,7 +9,6 @@ use std::slice;
 
 use log::warn;
 use crate::node::{LxmfNode, DestHash};
-use crate::framing::{hdlc_encode, kiss_encode};
 
 pub const STATUS_OK: i32 = 0;
 pub const STATUS_ERR: i32 = -1;
@@ -270,30 +269,6 @@ pub unsafe extern "C" fn lxmf_set_log_level(level: u32) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn lxmf_abi_version() -> u32 { LxmfNode::abi_version() }
-
-// --- Framing helpers ---
-
-#[no_mangle]
-pub unsafe extern "C" fn lxmf_hdlc_encode(
-    data_ptr: *const u8, data_len: usize, out_ptr: *mut u8, out_capacity: usize,
-) -> i32 {
-    if data_ptr.is_null() || out_ptr.is_null() { return STATUS_ERR; }
-    let encoded = hdlc_encode(slice::from_raw_parts(data_ptr, data_len));
-    if encoded.len() > out_capacity { return STATUS_ERR; }
-    std::ptr::copy_nonoverlapping(encoded.as_ptr(), out_ptr, encoded.len());
-    encoded.len() as i32
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lxmf_kiss_encode(
-    data_ptr: *const u8, data_len: usize, out_ptr: *mut u8, out_capacity: usize,
-) -> i32 {
-    if data_ptr.is_null() || out_ptr.is_null() { return STATUS_ERR; }
-    let encoded = kiss_encode(slice::from_raw_parts(data_ptr, data_len));
-    if encoded.len() > out_capacity { return STATUS_ERR; }
-    std::ptr::copy_nonoverlapping(encoded.as_ptr(), out_ptr, encoded.len());
-    encoded.len() as i32
-}
 
 // --- BLE Interface (iOS C FFI) ---
 //

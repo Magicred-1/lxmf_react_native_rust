@@ -166,7 +166,7 @@ impl LxmfNode {
         match mode {
             3 => {
                 let interfaces = parse_interfaces_json(interfaces_json)?;
-                Self::start_reticulum(identity_hex, address_hex, &interfaces, announce_interval_ms, display_name)
+                Self::start_reticulum(identity_hex, &interfaces, announce_interval_ms, display_name)
             }
             0 => Self::start_ble(identity_hex, address_hex, display_name),
             _ => Err(format!("Unsupported mode: {}. Use 0 (BLE) or 3 (Reticulum TCP)", mode)),
@@ -176,7 +176,6 @@ impl LxmfNode {
     /// Start with full Reticulum transport (mode 3)
     fn start_reticulum(
         identity_hex: &str,
-        address_hex: &str,
         interfaces: &[(String, u16)],
         announce_interval_ms: u64,
         display_name: &str,

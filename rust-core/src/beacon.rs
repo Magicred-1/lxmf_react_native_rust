@@ -101,7 +101,6 @@ impl BeaconManager {
         };
 
         let elapsed = last.elapsed();
-        let start_time = Instant::now() - Duration::from_secs(self.announce_count as u64 * 15);
 
         if elapsed < ANNOUNCE_BURST_DURATION {
             elapsed >= ANNOUNCE_BURST_INTERVAL

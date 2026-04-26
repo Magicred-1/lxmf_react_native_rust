@@ -75,22 +75,6 @@ func lxmf_set_log_level(_ level: UInt32) -> Int32
 @_silgen_name("lxmf_abi_version")
 func lxmf_abi_version() -> UInt32
 
-@_silgen_name("lxmf_hdlc_encode")
-func lxmf_hdlc_encode(
-    _ dataPtr: UnsafePointer<UInt8>?,
-    _ dataLen: Int,
-    _ outPtr: UnsafeMutablePointer<UInt8>?,
-    _ outCapacity: Int
-) -> Int32
-
-@_silgen_name("lxmf_kiss_encode")
-func lxmf_kiss_encode(
-    _ dataPtr: UnsafePointer<UInt8>?,
-    _ dataLen: Int,
-    _ outPtr: UnsafeMutablePointer<UInt8>?,
-    _ outCapacity: Int
-) -> Int32
-
 @_silgen_name("lxmf_fetch_messages")
 func lxmf_fetch_messages(
     _ limit: UInt32,
