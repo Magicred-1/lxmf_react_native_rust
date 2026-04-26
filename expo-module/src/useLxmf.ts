@@ -38,6 +38,8 @@ export enum LxmfNodeMode {
   TcpServer = 2,
   /** Connect to standard Reticulum daemon (rnsd) via HDLC-framed TCP */
   Reticulum = 3,
+  /** TCP/Reticulum + BLE simultaneously on the same transport instance */
+  ReticulumAndBle = 4,
 }
 
 export interface TcpInterface {

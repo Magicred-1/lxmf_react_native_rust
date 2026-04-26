@@ -169,7 +169,11 @@ impl LxmfNode {
                 Self::start_reticulum(identity_hex, &interfaces, announce_interval_ms, display_name)
             }
             0 => Self::start_ble(identity_hex, address_hex, display_name),
-            _ => Err(format!("Unsupported mode: {}. Use 0 (BLE) or 3 (Reticulum TCP)", mode)),
+            4 => {
+                let interfaces = parse_interfaces_json(interfaces_json)?;
+                Self::start_full(identity_hex, &interfaces, announce_interval_ms, display_name)
+            }
+            _ => Err(format!("Unsupported mode: {}. Use 0 (BLE), 3 (TCP), or 4 (TCP+BLE)", mode)),
         }
     }
 
@@ -442,6 +446,280 @@ impl LxmfNode {
         node.task_handles = task_handles;
 
         info!("LxmfNode: Reticulum transport started");
+        Ok(())
+    }
+
+    /// Start with full Reticulum TCP + BLE transport simultaneously (mode 4).
+    ///
+    /// Identical to start_reticulum except:
+    /// - BleInterface and NusInterface are also registered on the same Transport
+    /// - 200ms BLE poll warmup after the 2s TCP connect delay
+    /// - Two extra tasks: event-driven re-announce on BLE peer connect, and
+    ///   initial 5s post-connect re-announce followed by a 300s steady loop.
+    fn start_full(
+        identity_hex: &str,
+        interfaces: &[(String, u16)],
+        announce_interval_ms: u64,
+        display_name: &str,
+    ) -> Result<(), String> {
+        use rns_transport::identity::PrivateIdentity;
+        use rns_transport::transport::TransportConfig;
+        use rns_transport::destination::DestinationName;
+        use rns_transport::iface::tcp_client::TcpClient;
+
+        if interfaces.is_empty() {
+            return Err("Mode 4 (TCP+BLE) requires at least one TCP interface".into());
+        }
+
+        let private_identity = if identity_hex.len() == 128 {
+            PrivateIdentity::new_from_hex_string(identity_hex)
+                .map_err(|e| format!("Invalid identity hex: {:?}", e))?
+        } else {
+            info!("LxmfNode full: generating new identity");
+            PrivateIdentity::new_from_rand(rand_core::OsRng)
+        };
+
+        let id_hex = private_identity.to_hex_string();
+        info!("LxmfNode full: identity={}", &id_hex[..16]);
+        let id_bytes = private_identity.to_private_key_bytes().to_vec();
+
+        let events = {
+            let guard = Self::global().lock().map_err(|e| e.to_string())?;
+            let node = guard.as_ref().ok_or("Node not initialized")?;
+            Arc::clone(&node.events)
+        };
+
+        let rt = get_runtime();
+
+        let name_bytes: Vec<u8> = if display_name.is_empty() {
+            b"lxmf-mobile".to_vec()
+        } else {
+            display_name.as_bytes()[..display_name.len().min(32)].to_vec()
+        };
+
+        let name_bytes_init = name_bytes.clone();
+        let (transport_arc, my_dest, mut data_rx, mut resource_rx, announce_rx, lxmf_addr_hex) = rt.block_on(async move {
+            let config = TransportConfig::new("lxmf-mobile", &private_identity, true);
+            let mut transport = Transport::new(config);
+
+            {
+                let iface_mgr = transport.iface_manager();
+                let mut mgr = iface_mgr.lock().await;
+                for (host, port) in interfaces {
+                    let addr = format!("{}:{}", host, port);
+                    info!("LxmfNode full: connecting TCP to {}", addr);
+                    mgr.spawn(TcpClient::new(&addr), TcpClient::spawn);
+                }
+                // BLE interfaces on the same transport instance
+                mgr.spawn(BleInterface::new(), BleInterface::spawn);
+                mgr.spawn(NusInterface::new(), NusInterface::spawn);
+            }
+
+            let dest_name = DestinationName::new("lxmf", "delivery");
+            let my_dest = transport.add_destination(private_identity.clone(), dest_name).await;
+
+            let lxmf_addr_hex = {
+                let d = my_dest.lock().await;
+                hex::encode(d.desc.address_hash.as_slice())
+            };
+
+            // TCP connect delay, then BLE poll warmup
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+            info!("LxmfNode full: sending announce as {}", lxmf_addr_hex);
+            transport.send_announce(&my_dest, Some(name_bytes_init.as_slice())).await;
+
+            let data_rx = transport.received_data_events();
+            let resource_rx = transport.resource_events();
+            let announce_rx = transport.recv_announces().await;
+
+            let arc = Arc::new(tokio::sync::Mutex::new(transport));
+            (arc, my_dest, data_rx, resource_rx, announce_rx, lxmf_addr_hex)
+        });
+
+        let addr_hex = lxmf_addr_hex;
+
+        if let Ok(mut eq) = events.lock() {
+            eq.push_back(LxmfEvent::StatusChanged { running: true, lifecycle: 4 });
+        }
+
+        let pending_for_ann = {
+            let guard = Self::global().lock().map_err(|e| e.to_string())?;
+            let node = guard.as_ref().ok_or("Node not initialized")?;
+            Arc::clone(&node.pending_sends)
+        };
+        let transport_for_ann = Arc::clone(&transport_arc);
+
+        let mut task_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        // Announce receiver (identical to mode 3, with opportunistic flush)
+        let events_ann = Arc::clone(&events);
+        let mut announce_rx = announce_rx;
+        task_handles.push(rt.spawn(async move {
+            loop {
+                match announce_rx.recv().await {
+                    Ok(event) => {
+                        let dest = event.destination.lock().await;
+                        let hash_bytes = dest.desc.address_hash;
+                        let mut dh = [0u8; 16];
+                        dh.copy_from_slice(hash_bytes.as_slice());
+                        let app_data = event.app_data.as_slice().to_vec();
+                        info!("LxmfNode full: announce from {} ({} hops)", hex::encode(&dh), event.hops);
+                        drop(dest);
+
+                        let to_retry: Vec<(u64, Vec<u8>)> = {
+                            let mut q = pending_for_ann.lock().unwrap_or_else(|p| p.into_inner());
+                            let (matched, rest): (Vec<_>, Vec<_>) =
+                                q.drain(..).partition(|s| s.dest == dh);
+                            *q = rest;
+                            matched.into_iter().map(|s| (s.seq, s.lxmf_payload)).collect()
+                        };
+
+                        if !to_retry.is_empty() {
+                            use rns_transport::hash::AddressHash;
+                            use rns_transport::packet::{Packet, PacketDataBuffer};
+                            let transport = transport_for_ann.lock().await;
+                            for (seq, payload) in &to_retry {
+                                let mut dest_arr = [0u8; 16];
+                                dest_arr.copy_from_slice(&payload[..16]);
+                                let packet = Packet {
+                                    destination: AddressHash::new(dest_arr),
+                                    data: PacketDataBuffer::new_from_slice(payload),
+                                    ..Default::default()
+                                };
+                                let outcome = transport.send_packet_with_outcome(packet).await;
+                                info!("LxmfNode full: opportunistic retry seq={} -> {:?}", seq, outcome);
+                            }
+                        }
+
+                        if let Ok(mut eq) = events_ann.lock() {
+                            eq.push_back(LxmfEvent::AnnounceReceived { dest_hash: dh, app_data, hops: event.hops });
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("LxmfNode full: lagged {} announce events", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }));
+
+        // Data receiver
+        let events_data = Arc::clone(&events);
+        task_handles.push(rt.spawn(async move {
+            loop {
+                match data_rx.recv().await {
+                    Ok(received) => {
+                        let mut src = [0u8; 16];
+                        src.copy_from_slice(received.destination.as_slice());
+                        let data = received.data.as_slice().to_vec();
+                        info!("LxmfNode full: received {} bytes from {}", data.len(), hex::encode(&src));
+                        if let Ok(mut eq) = events_data.lock() {
+                            eq.push_back(LxmfEvent::MessageReceived {
+                                source: src,
+                                content: data,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            });
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("LxmfNode full: lagged {} data events", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }));
+
+        // Resource receiver (large messages)
+        let events_res = Arc::clone(&events);
+        task_handles.push(rt.spawn(async move {
+            use rns_transport::resource::ResourceEventKind;
+            loop {
+                match resource_rx.recv().await {
+                    Ok(event) => {
+                        if let ResourceEventKind::Complete(complete) = event.kind {
+                            let mut src = [0u8; 16];
+                            src.copy_from_slice(event.link_id.as_slice());
+                            let data = complete.data;
+                            info!("LxmfNode full: resource complete {} bytes from {}", data.len(), hex::encode(&src));
+                            if let Ok(mut eq) = events_res.lock() {
+                                eq.push_back(LxmfEvent::MessageReceived {
+                                    source: src,
+                                    content: data,
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                });
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("LxmfNode full: lagged {} resource events", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }));
+
+        // TCP periodic re-announce
+        let transport_reannounce = Arc::clone(&transport_arc);
+        let my_dest_tcp = Arc::clone(&my_dest);
+        let name_bytes_tcp = name_bytes.clone();
+        let interval_ms = if announce_interval_ms > 0 { announce_interval_ms } else { 300_000 };
+        task_handles.push(rt.spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms)).await;
+                info!("LxmfNode full: TCP periodic re-announce");
+                transport_reannounce.lock().await.send_announce(&my_dest_tcp, Some(name_bytes_tcp.as_slice())).await;
+            }
+        }));
+
+        // BLE event-driven re-announce on peer connect
+        let transport_pc = Arc::clone(&transport_arc);
+        let my_dest_pc = Arc::clone(&my_dest);
+        let name_bytes_pc = name_bytes.clone();
+        let notify = crate::ble_iface::peer_connected_notify();
+        task_handles.push(rt.spawn(async move {
+            loop {
+                notify.notified().await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                info!("LxmfNode full: re-announce on BLE peer connect");
+                transport_pc.lock().await.send_announce(&my_dest_pc, Some(name_bytes_pc.as_slice())).await;
+            }
+        }));
+
+        // BLE initial post-connect (5s) + steady 300s re-announce
+        let transport_ble = Arc::clone(&transport_arc);
+        let name_bytes_ble = name_bytes.clone();
+        task_handles.push(rt.spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            info!("LxmfNode full: BLE initial post-connect re-announce");
+            transport_ble.lock().await.send_announce(&my_dest, Some(name_bytes_ble.as_slice())).await;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+                info!("LxmfNode full: BLE periodic re-announce");
+                transport_ble.lock().await.send_announce(&my_dest, Some(name_bytes_ble.as_slice())).await;
+            }
+        }));
+
+        info!("LxmfNode full: TCP+BLE delivery address = {}", addr_hex);
+
+        let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
+        let node = guard.as_mut().ok_or("Node not initialized")?;
+        node.running = true;
+        node.mode = 4;
+        node.identity_hex = id_hex;
+        node.address_hex = addr_hex;
+        node.identity_bytes = Some(id_bytes);
+        node.transport = Some(transport_arc);
+        node.task_handles = task_handles;
+
+        info!("LxmfNode: TCP+BLE transport started");
         Ok(())
     }
 
