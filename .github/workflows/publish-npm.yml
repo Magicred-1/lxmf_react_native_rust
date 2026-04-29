@@ -1,0 +1,135 @@
+name: Build & Publish NPM Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+
+  # ── iOS: must run on macOS (xcodebuild + lipo) ─────────────────────────────
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ios-cargo-${{ hashFiles('rust-core/Cargo.lock') }}
+
+      - name: Build iOS device (arm64)
+        working-directory: rust-core
+        run: cargo build --release --target aarch64-apple-ios
+
+      - name: Build iOS simulator arm64
+        working-directory: rust-core
+        run: cargo build --release --target aarch64-apple-ios-sim
+
+      - name: Build iOS simulator x86_64
+        working-directory: rust-core
+        run: cargo build --release --target x86_64-apple-ios
+
+      - name: Lipo simulator fat lib (arm64 + x86_64)
+        run: |
+          mkdir -p rust-core/target/sim-fat
+          lipo -create \
+            rust-core/target/aarch64-apple-ios-sim/release/liblxmf_rn.a \
+            rust-core/target/x86_64-apple-ios/release/liblxmf_rn.a \
+            -output rust-core/target/sim-fat/liblxmf_rn.a
+
+      - name: Create XCFramework
+        run: |
+          mkdir -p dist/ios
+          xcodebuild -create-xcframework \
+            -library rust-core/target/aarch64-apple-ios/release/liblxmf_rn.a \
+            -library rust-core/target/sim-fat/liblxmf_rn.a \
+            -output dist/ios/liblxmf_rn.xcframework
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcframework
+          path: dist/ios/liblxmf_rn.xcframework
+
+  # ── Android: ubuntu-latest has SDK pre-installed ────────────────────────────
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: android-cargo-${{ hashFiles('rust-core/Cargo.lock') }}
+
+      - name: Install NDK 27
+        run: |
+          echo "y" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> $GITHUB_ENV
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build all Android ABIs
+        working-directory: rust-core
+        run: |
+          cargo ndk \
+            -t arm64-v8a \
+            -t armeabi-v7a \
+            -t x86_64 \
+            -o ../dist/android \
+            build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-jniLibs
+          path: dist/android/
+
+  # ── Publish: assemble artifacts + npm publish ───────────────────────────────
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build-ios, build-android]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download iOS xcframework
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-xcframework
+          path: expo-module/ios/RustCore/liblxmf_rn.xcframework
+
+      - name: Download Android jniLibs
+        uses: actions/download-artifact@v4
+        with:
+          name: android-jniLibs
+          path: expo-module/android/src/main/jniLibs/
+
+      - name: Build TypeScript
+        working-directory: expo-module
+        run: npm ci && npm run build
+
+      - name: Publish to npm
+        working-directory: expo-module
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
