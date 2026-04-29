@@ -538,6 +538,7 @@ extension BLEManager: CBPeripheralManagerDelegate {
                     }
                 }
             }
+            // CoreBluetooth no-ops this for writeWithoutResponse — safe to call unconditionally.
             peripheral.respond(to: request, withResult: .success)
         }
     }
