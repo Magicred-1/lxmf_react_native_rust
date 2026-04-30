@@ -17,3 +17,6 @@ pub mod store;
 
 #[cfg(target_os = "android")]
 pub mod jni_bridge;
+
+#[cfg(test)]
+mod tests;
