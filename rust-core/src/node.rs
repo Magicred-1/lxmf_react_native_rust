@@ -1420,3 +1420,439 @@ fn parse_interfaces_json(json: &str) -> Result<Vec<(String, u16)>, String> {
     }
     Ok(out)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Build a fake LXMF wire payload (96-byte zero header + msgpack).
+    fn make_wire(title: &[u8], body: &[u8], fields_mp: &[u8]) -> Vec<u8> {
+        let mut wire = vec![0u8; 96];
+        wire.extend_from_slice(&encode_lxmf_msgpack(1_700_000_000.0, title, body, fields_mp));
+        wire
+    }
+
+    // ── mp_bin ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mp_bin_empty() {
+        let b = mp_bin(b"");
+        assert_eq!(b, vec![0xc4, 0x00]);
+    }
+
+    #[test]
+    fn mp_bin_small() {
+        let b = mp_bin(b"hi");
+        assert_eq!(&b, &[0xc4, 0x02, b'h', b'i']);
+    }
+
+    #[test]
+    fn mp_bin_255_bytes() {
+        let data = vec![0xabu8; 255];
+        let b = mp_bin(&data);
+        assert_eq!(b[0], 0xc4);
+        assert_eq!(b[1], 255);
+        assert_eq!(b.len(), 257);
+    }
+
+    #[test]
+    fn mp_bin_256_bytes_uses_bin16() {
+        let data = vec![0u8; 256];
+        let b = mp_bin(&data);
+        assert_eq!(b[0], 0xc5);
+        assert_eq!((b[1] as usize) << 8 | b[2] as usize, 256);
+        assert_eq!(b.len(), 259);
+    }
+
+    // ── mp_str ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mp_str_fixstr() {
+        let s = mp_str(b"hello");
+        assert_eq!(s[0], 0xa5); // 0xa0 | 5
+        assert_eq!(&s[1..], b"hello");
+    }
+
+    #[test]
+    fn mp_str_31_chars() {
+        let s = mp_str(&[b'x'; 31]);
+        assert_eq!(s[0], 0xbf); // 0xa0 | 31
+    }
+
+    #[test]
+    fn mp_str_32_chars_uses_str8() {
+        let s = mp_str(&[b'x'; 32]);
+        assert_eq!(s[0], 0xd9);
+        assert_eq!(s[1], 32);
+    }
+
+    // ── mp_array ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mp_array_fixarray() {
+        let entries = vec![vec![0x01u8], vec![0x02u8]];
+        let a = mp_array(&entries);
+        assert_eq!(a[0], 0x92); // fixarray(2)
+        assert_eq!(a[1..], [0x01, 0x02]);
+    }
+
+    #[test]
+    fn mp_array_empty() {
+        let a = mp_array(&[]);
+        assert_eq!(a, vec![0x90]);
+    }
+
+    // ── encode_lxmf_msgpack ──────────────────────────────────────────────────
+
+    #[test]
+    fn msgpack_header_is_fixarray4() {
+        let mp = encode_lxmf_msgpack(0.0, b"", b"hello", &[0x80]);
+        assert_eq!(mp[0], 0x94, "must start with fixarray(4)");
+    }
+
+    #[test]
+    fn msgpack_timestamp_is_float64() {
+        let mp = encode_lxmf_msgpack(1_700_000_000.0, b"", b"", &[0x80]);
+        assert_eq!(mp[1], 0xcb, "timestamp must be float64");
+    }
+
+    #[test]
+    fn msgpack_empty_fields_is_0x80() {
+        let mp = encode_lxmf_msgpack(0.0, b"", b"", &[0x80]);
+        assert_eq!(*mp.last().unwrap(), 0x80);
+    }
+
+    // ── build_fields_msgpack ─────────────────────────────────────────────────
+
+    #[test]
+    fn fields_none_gives_empty_map() {
+        assert_eq!(build_fields_msgpack(None), vec![0x80]);
+    }
+
+    #[test]
+    fn fields_empty_string_gives_empty_map() {
+        assert_eq!(build_fields_msgpack(Some("")), vec![0x80]);
+    }
+
+    #[test]
+    fn fields_null_string_gives_empty_map() {
+        assert_eq!(build_fields_msgpack(Some("null")), vec![0x80]);
+    }
+
+    #[test]
+    fn fields_image_produces_field_0x06() {
+        let img_data = b"FAKEIMGDATA";
+        let json = format!(
+            r#"{{"image":{{"mimeType":"image/jpeg","data":"{}"}}}}"#,
+            B64.encode(img_data)
+        );
+        let mp = build_fields_msgpack(Some(&json));
+        // fixmap(1) { 0x06: fixarray(2) [str(mime), bin(data)] }
+        assert_eq!(mp[0], 0x81, "fixmap(1)");
+        assert_eq!(mp[1], 0x06, "FIELD_IMAGE key");
+        assert_eq!(mp[2], 0x92, "fixarray(2) value");
+    }
+
+    #[test]
+    fn fields_files_produces_field_0x05() {
+        let json = format!(
+            r#"{{"files":[{{"name":"doc.txt","data":"{}"}}]}}"#,
+            B64.encode(b"hello file")
+        );
+        let mp = build_fields_msgpack(Some(&json));
+        assert_eq!(mp[0], 0x81, "fixmap(1)");
+        assert_eq!(mp[1], 0x05, "FIELD_FILE_ATTACHMENTS key");
+        assert_eq!(mp[2], 0x91, "fixarray(1) — one file");
+    }
+
+    #[test]
+    fn fields_image_and_files_fixmap2() {
+        let json = format!(
+            r#"{{"image":{{"mimeType":"image/png","data":"{}"}},"files":[{{"name":"x","data":"{}"}}]}}"#,
+            B64.encode(b"png"), B64.encode(b"file")
+        );
+        let mp = build_fields_msgpack(Some(&json));
+        assert_eq!(mp[0] & 0xf0, 0x80, "must be a fixmap");
+        assert_eq!(mp[0] & 0x0f, 2, "must have 2 entries");
+    }
+
+    #[test]
+    fn fields_bad_base64_skipped() {
+        let mp = build_fields_msgpack(Some(r#"{"image":{"mimeType":"image/jpeg","data":"!!!"}}"#));
+        assert_eq!(mp, vec![0x80], "bad base64 → empty map");
+    }
+
+    // ── decode_lxmf_payload ──────────────────────────────────────────────────
+
+    #[test]
+    fn decode_too_short_returns_none() {
+        assert!(decode_lxmf_payload(&[0u8; 50]).is_none());
+    }
+
+    #[test]
+    fn decode_wrong_first_byte_returns_none() {
+        let mut wire = vec![0u8; 96];
+        wire.push(0x93); // fixarray(3) — wrong
+        assert!(decode_lxmf_payload(&wire).is_none());
+    }
+
+    #[test]
+    fn decode_roundtrip_no_media() {
+        let wire = make_wire(b"subject", b"hello world", &[0x80]);
+        let dec = decode_lxmf_payload(&wire).expect("should decode");
+        assert_eq!(dec.title, b"subject");
+        assert_eq!(dec.body,  b"hello world");
+        assert!(dec.image.is_none());
+        assert!(dec.files.is_empty());
+    }
+
+    #[test]
+    fn decode_roundtrip_empty_body() {
+        let wire = make_wire(b"", b"", &[0x80]);
+        let dec = decode_lxmf_payload(&wire).expect("should decode");
+        assert_eq!(dec.body, b"");
+    }
+
+    #[test]
+    fn decode_roundtrip_with_image() {
+        let img = b"\xff\xd8\xff\xe0fake_jpeg";
+        let json = format!(r#"{{"image":{{"mimeType":"image/jpeg","data":"{}"}}}}"#, B64.encode(img));
+        let fields_mp = build_fields_msgpack(Some(&json));
+        let wire = make_wire(b"", b"see image", &fields_mp);
+        let dec = decode_lxmf_payload(&wire).expect("should decode");
+        assert_eq!(dec.body, b"see image");
+        let (mime, data) = dec.image.expect("image should be present");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(data, img);
+    }
+
+    #[test]
+    fn decode_roundtrip_with_files() {
+        let file_data = b"PDF content here";
+        let json = format!(
+            r#"{{"files":[{{"name":"report.pdf","data":"{}"}}]}}"#,
+            B64.encode(file_data)
+        );
+        let fields_mp = build_fields_msgpack(Some(&json));
+        let wire = make_wire(b"title", b"body", &fields_mp);
+        let dec = decode_lxmf_payload(&wire).expect("should decode");
+        assert_eq!(dec.files.len(), 1);
+        assert_eq!(dec.files[0].0, "report.pdf");
+        assert_eq!(dec.files[0].1, file_data);
+    }
+
+    #[test]
+    fn decode_roundtrip_full_media() {
+        let json = format!(
+            r#"{{"image":{{"mimeType":"image/png","data":"{}"}},"files":[{{"name":"a.txt","data":"{}"}},{{"name":"b.bin","data":"{}"}}]}}"#,
+            B64.encode(b"png_bytes"),
+            B64.encode(b"text content"),
+            B64.encode(b"\x00\x01\x02binary"),
+        );
+        let fields_mp = build_fields_msgpack(Some(&json));
+        let wire = make_wire(b"multi", b"both fields", &fields_mp);
+        let dec = decode_lxmf_payload(&wire).expect("should decode");
+        assert_eq!(dec.title, b"multi");
+        assert_eq!(dec.body, b"both fields");
+        let (mime, _) = dec.image.expect("image present");
+        assert_eq!(mime, "image/png");
+        assert_eq!(dec.files.len(), 2);
+        assert_eq!(dec.files[0].0, "a.txt");
+        assert_eq!(dec.files[1].0, "b.bin");
+    }
+
+    #[test]
+    fn decode_large_body_bin16() {
+        let large = vec![0xabu8; 300]; // forces bin16
+        let wire = make_wire(b"", &large, &[0x80]);
+        let dec = decode_lxmf_payload(&wire).expect("should decode large body");
+        assert_eq!(dec.body, large);
+    }
+
+    // ── lxmf_event_from_bytes fallback ───────────────────────────────────────
+
+    #[test]
+    fn event_from_garbage_falls_back_to_raw_body() {
+        let garbage = vec![0xffu8; 30];
+        let src = [0u8; 16];
+        match lxmf_event_from_bytes(src, garbage.clone()) {
+            LxmfEvent::MessageReceived { body, title, image, files, .. } => {
+                assert_eq!(body, garbage);
+                assert!(title.is_empty());
+                assert!(image.is_none());
+                assert!(files.is_empty());
+            }
+            _ => panic!("expected MessageReceived"),
+        }
+    }
+
+    // ── build_app_data / beacon announces ────────────────────────────────────
+
+    #[test]
+    fn beacon_app_data_starts_with_prefix() {
+        let ad = build_app_data("my-node", true);
+        assert!(ad.starts_with(b"anonmesh::beacon::v1\0"),
+            "beacon app_data must start with the beacon prefix");
+    }
+
+    #[test]
+    fn beacon_app_data_contains_display_name() {
+        let ad = build_app_data("alice", true);
+        assert!(ad.ends_with(b"alice"),
+            "beacon app_data must end with display name");
+    }
+
+    #[test]
+    fn non_beacon_app_data_is_just_name() {
+        let ad = build_app_data("bob", false);
+        assert_eq!(ad, b"bob");
+    }
+
+    #[test]
+    fn empty_display_name_falls_back_to_lxmf_mobile() {
+        assert_eq!(build_app_data("", false), b"lxmf-mobile");
+        let beacon = build_app_data("", true);
+        assert!(beacon.ends_with(b"lxmf-mobile"));
+    }
+
+    #[test]
+    fn display_name_clamped_at_32_bytes() {
+        let long = "a".repeat(64);
+        let ad = build_app_data(&long, false);
+        assert_eq!(ad.len(), 32);
+    }
+
+    #[test]
+    fn beacon_name_clamped_at_32_bytes() {
+        let long = "b".repeat(64);
+        let ad = build_app_data(&long, true);
+        let prefix = b"anonmesh::beacon::v1\0";
+        assert!(ad.starts_with(prefix));
+        assert_eq!(ad.len(), prefix.len() + 32);
+    }
+
+    // ── parse_interfaces_json ────────────────────────────────────────────────
+
+    #[test]
+    fn interfaces_valid_single() {
+        let ifaces = parse_interfaces_json(r#"[{"host":"1.2.3.4","port":4242}]"#).unwrap();
+        assert_eq!(ifaces.len(), 1);
+        assert_eq!(ifaces[0], ("1.2.3.4".into(), 4242u16));
+    }
+
+    #[test]
+    fn interfaces_valid_multiple() {
+        let ifaces = parse_interfaces_json(
+            r#"[{"host":"a.com","port":1000},{"host":"b.com","port":2000}]"#
+        ).unwrap();
+        assert_eq!(ifaces.len(), 2);
+        assert_eq!(ifaces[1].1, 2000);
+    }
+
+    #[test]
+    fn interfaces_empty_array() {
+        assert_eq!(parse_interfaces_json("[]").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn interfaces_missing_host_errors() {
+        assert!(parse_interfaces_json(r#"[{"port":1234}]"#).is_err());
+    }
+
+    #[test]
+    fn interfaces_empty_host_errors() {
+        assert!(parse_interfaces_json(r#"[{"host":"","port":1234}]"#).is_err());
+    }
+
+    #[test]
+    fn interfaces_zero_port_errors() {
+        assert!(parse_interfaces_json(r#"[{"host":"x","port":0}]"#).is_err());
+    }
+
+    #[test]
+    fn interfaces_port_too_large_errors() {
+        assert!(parse_interfaces_json(r#"[{"host":"x","port":99999}]"#).is_err());
+    }
+
+    #[test]
+    fn interfaces_invalid_json_errors() {
+        assert!(parse_interfaces_json("not json").is_err());
+    }
+
+    // ── mp_skip / unknown fields don't crash decode ───────────────────────────
+
+    #[test]
+    fn decode_ignores_unknown_field_ids() {
+        // Build a fields map with an unknown field (key 0x99) before FIELD_IMAGE
+        let img = b"fake";
+        let mut custom_fields: Vec<u8> = vec![0x82]; // fixmap(2)
+        // unknown field: key=0x40, value=bin8(2 bytes)
+        custom_fields.push(0x40);
+        custom_fields.extend_from_slice(&[0xc4, 0x02, 0xde, 0xad]);
+        // FIELD_IMAGE: key=0x06, fixarray(2) [str(mime), bin(data)]
+        custom_fields.push(0x06);
+        custom_fields.push(0x92);
+        custom_fields.extend_from_slice(&mp_str(b"image/gif"));
+        custom_fields.extend_from_slice(&mp_bin(img));
+
+        let wire = make_wire(b"", b"body", &custom_fields);
+        let dec = decode_lxmf_payload(&wire).expect("should decode despite unknown field");
+        assert_eq!(dec.body, b"body");
+        assert!(dec.image.is_some(), "FIELD_IMAGE should still be parsed");
+        let (mime, data) = dec.image.unwrap();
+        assert_eq!(mime, "image/gif");
+        assert_eq!(data, img);
+    }
+
+    // ── send encode / decode symmetry ────────────────────────────────────────
+
+    #[test]
+    fn send_decode_text_only_symmetry() {
+        let body_text = b"Hello, LXMF!";
+        let fields_mp = build_fields_msgpack(None);
+        let wire = make_wire(b"greeting", body_text, &fields_mp);
+        let dec = decode_lxmf_payload(&wire).unwrap();
+        assert_eq!(dec.title, b"greeting");
+        assert_eq!(dec.body, body_text);
+        assert!(dec.image.is_none());
+    }
+
+    #[test]
+    fn send_decode_binary_body() {
+        let binary_body: Vec<u8> = (0..=255u8).collect();
+        let wire = make_wire(b"", &binary_body, &[0x80]);
+        let dec = decode_lxmf_payload(&wire).unwrap();
+        assert_eq!(dec.body, binary_body);
+    }
+
+    #[test]
+    fn multiple_files_roundtrip() {
+        let files: Vec<(&str, &[u8])> = vec![
+            ("photo.jpg", b"\xff\xd8jpeg"),
+            ("notes.txt", b"some notes"),
+            ("data.bin",  &[0x00, 0xff, 0x7f, 0x80]),
+        ];
+        let json = format!(
+            r#"{{"files":[{}]}}"#,
+            files.iter().map(|(name, data)| {
+                format!(r#"{{"name":"{}","data":"{}"}}"#, name, B64.encode(data))
+            }).collect::<Vec<_>>().join(",")
+        );
+        let fields_mp = build_fields_msgpack(Some(&json));
+        let wire = make_wire(b"", b"attachments", &fields_mp);
+        let dec = decode_lxmf_payload(&wire).unwrap();
+        assert_eq!(dec.files.len(), 3);
+        for (i, (name, data)) in files.iter().enumerate() {
+            assert_eq!(dec.files[i].0, *name);
+            assert_eq!(dec.files[i].1, *data);
+        }
+    }
+}
