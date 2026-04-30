@@ -62,10 +62,10 @@ export interface TcpInterface {
  *  Compatible with Sideband and other LXMF clients.
  */
 export interface LxmfMedia {
-  /** Inline image: LXMF FIELD_IMAGE — rendered by receiving clients. */
-  image?: { mimeType: string; dataBase64: string };
-  /** File attachments: LXMF FIELD_FILE_ATTACHMENTS — list of named blobs. */
-  files?: { name: string; dataBase64: string }[];
+  /** Inline image: LXMF FIELD_IMAGE — rendered by receiving clients. data = base64 string. */
+  image?: { mimeType: string; data: string };
+  /** File attachments: LXMF FIELD_FILE_ATTACHMENTS — list of named blobs. data = base64 string. */
+  files?: { name: string; data: string }[];
 }
 
 export interface UseLxmfOptions {
