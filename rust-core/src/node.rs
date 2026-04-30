@@ -8,7 +8,7 @@
 //! to all other nodes on the network.
 
 use std::sync::{Arc, Mutex, OnceLock};
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 
 use log::{info, warn};
 use serde_json;
@@ -106,6 +106,9 @@ pub struct LxmfNode {
     pub messages_received: u64,
     /// Opportunistic send queue: messages awaiting a peer announce before delivery
     pending_sends: Arc<Mutex<Vec<PendingSend>>>,
+    /// Peer identity cache: address_hash → DestinationDesc (populated from announces).
+    /// Used to construct links for large payloads that exceed the 464B packet MTU.
+    peer_identities: Arc<Mutex<HashMap<[u8; 16], rns_transport::destination::DestinationDesc>>>,
     /// JoinHandles for every task spawned during start_*. Aborted on stop()
     /// to prevent zombie tasks accumulating across Stop/Start cycles and mode
     /// switches (each leaked task fires its own timers and pollutes logs).
@@ -147,6 +150,7 @@ impl LxmfNode {
             announces_received: 0,
             messages_received: 0,
             pending_sends: Arc::new(Mutex::new(Vec::new())),
+            peer_identities: Arc::new(Mutex::new(HashMap::new())),
             task_handles: Vec::new(),
         };
 
@@ -296,10 +300,10 @@ impl LxmfNode {
         }
 
         // Grab the pending-send queue so the announce task can flush it
-        let pending_for_ann = {
+        let (pending_for_ann, peer_ids_arc) = {
             let guard = Self::global().lock().map_err(|e| e.to_string())?;
             let node = guard.as_ref().ok_or("Node not initialized")?;
-            Arc::clone(&node.pending_sends)
+            (Arc::clone(&node.pending_sends), Arc::clone(&node.peer_identities))
         };
         let transport_for_ann = Arc::clone(&transport_arc);
 
@@ -328,6 +332,7 @@ impl LxmfNode {
         let events_ann = Arc::clone(&events);
         let store_ann = store_arc.clone();
         let pending_for_ann_task = Arc::clone(&pending_for_ann);
+        let peer_ids_ann = Arc::clone(&peer_ids_arc);
         let mut announce_rx = announce_rx;
         task_handles.push(rt.spawn(async move {
             let pending_for_ann = pending_for_ann_task;
@@ -335,12 +340,18 @@ impl LxmfNode {
                 match announce_rx.recv().await {
                     Ok(event) => {
                         let dest = event.destination.lock().await;
-                        let hash_bytes = dest.desc.address_hash;
+                        let desc = dest.desc;
+                        let hash_bytes = desc.address_hash;
                         let mut dh = [0u8; 16];
                         dh.copy_from_slice(hash_bytes.as_slice());
                         let app_data = event.app_data.as_slice().to_vec();
                         info!("LxmfNode: announce from {} ({} hops)", hex::encode(&dh), event.hops);
                         drop(dest);
+
+                        // Cache peer identity for large-payload link sends
+                        if let Ok(mut ids) = peer_ids_ann.lock() {
+                            ids.insert(dh, desc);
+                        }
 
                         // Flush any queued opportunistic sends for this peer
                         let to_retry: Vec<(u64, Option<i64>, Vec<u8>)> = {
@@ -355,6 +366,7 @@ impl LxmfNode {
                             use rns_transport::hash::AddressHash;
                             use rns_transport::packet::{Packet, PacketDataBuffer};
                             use rns_transport::transport::SendPacketOutcome;
+                            use rns_transport::delivery::send_via_link;
                             let transport = transport_for_ann.lock().await;
                             for (seq, store_id, payload) in &to_retry {
                                 let mut dest_arr = [0u8; 16];
@@ -366,19 +378,27 @@ impl LxmfNode {
                                 };
                                 let outcome = transport.send_packet_with_outcome(packet).await;
                                 info!("LxmfNode: opportunistic retry seq={} -> {:?}", seq, outcome);
-                                match outcome {
-                                    SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => {
-                                        if let Some(id) = store_id {
-                                            if let Some(s) = &store_ann { let _ = s.remove_outbound(*id); }
-                                        }
-                                        if let Ok(mut eq) = events_ann.lock() {
-                                            eq.push_back(LxmfEvent::MessageDelivered { seq: *seq, dest_hex: hex::encode(&dh) });
+                                let delivered = match outcome {
+                                    SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => true,
+                                    SendPacketOutcome::DroppedCiphertextTooLarge => {
+                                        // Large payload — attempt link + resource transfer
+                                        match send_via_link(&transport, desc, payload, std::time::Duration::from_secs(15)).await {
+                                            Ok(_) => { info!("LxmfNode: opportunistic link-send seq={} ok", seq); true }
+                                            Err(e) => { warn!("LxmfNode: opportunistic link-send seq={} failed: {e}", seq); false }
                                         }
                                     }
-                                    _ => {
-                                        let mut q = pending_for_ann.lock().unwrap_or_else(|p| p.into_inner());
-                                        q.push(PendingSend { seq: *seq, dest: dh, lxmf_payload: payload.clone(), store_id: *store_id });
+                                    _ => false,
+                                };
+                                if delivered {
+                                    if let Some(id) = store_id {
+                                        if let Some(s) = &store_ann { let _ = s.remove_outbound(*id); }
                                     }
+                                    if let Ok(mut eq) = events_ann.lock() {
+                                        eq.push_back(LxmfEvent::MessageDelivered { seq: *seq, dest_hex: hex::encode(&dh) });
+                                    }
+                                } else {
+                                    let mut q = pending_for_ann.lock().unwrap_or_else(|p| p.into_inner());
+                                    q.push(PendingSend { seq: *seq, dest: dh, lxmf_payload: payload.clone(), store_id: *store_id });
                                 }
                             }
                         }
@@ -468,6 +488,7 @@ impl LxmfNode {
         let pending_retry = Arc::clone(&pending_for_ann);
         let store_retry = store_arc.clone();
         let events_retry = Arc::clone(&events);
+        let peer_ids_retry = Arc::clone(&peer_ids_arc);
         task_handles.push(rt.spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -493,6 +514,7 @@ impl LxmfNode {
                     use rns_transport::hash::AddressHash;
                     use rns_transport::packet::{Packet, PacketDataBuffer};
                     use rns_transport::transport::SendPacketOutcome;
+                    use rns_transport::delivery::send_via_link;
                     let transport = transport_retry.lock().await;
                     for (seq, store_id, payload, dest) in snapshot {
                         let packet = Packet {
@@ -501,23 +523,34 @@ impl LxmfNode {
                             ..Default::default()
                         };
                         let outcome = transport.send_packet_with_outcome(packet).await;
-                        match outcome {
-                            SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => {
-                                {
-                                    let mut q = pending_retry.lock().unwrap_or_else(|p| p.into_inner());
-                                    q.retain(|s| s.seq != seq);
-                                }
-                                if let Some(id) = store_id {
-                                    if let Some(s) = &store_retry { let _ = s.remove_outbound(id); }
-                                }
-                                if let Ok(mut eq) = events_retry.lock() {
-                                    eq.push_back(LxmfEvent::MessageDelivered { seq, dest_hex: hex::encode(&dest) });
+                        let delivered = match outcome {
+                            SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => true,
+                            SendPacketOutcome::DroppedCiphertextTooLarge => {
+                                let cached_desc = peer_ids_retry.lock().ok().and_then(|ids| ids.get(&dest).copied());
+                                match cached_desc {
+                                    Some(desc) => match send_via_link(&transport, desc, &payload, std::time::Duration::from_secs(15)).await {
+                                        Ok(_) => { info!("LxmfNode: periodic link-send seq={} ok", seq); true }
+                                        Err(e) => { warn!("LxmfNode: periodic link-send seq={} failed: {e}", seq); false }
+                                    },
+                                    None => false,
                                 }
                             }
-                            _ => {
-                                if let Some(id) = store_id {
-                                    if let Some(s) = &store_retry { let _ = s.bump_outbound_attempts(id); }
-                                }
+                            _ => false,
+                        };
+                        if delivered {
+                            {
+                                let mut q = pending_retry.lock().unwrap_or_else(|p| p.into_inner());
+                                q.retain(|s| s.seq != seq);
+                            }
+                            if let Some(id) = store_id {
+                                if let Some(s) = &store_retry { let _ = s.remove_outbound(id); }
+                            }
+                            if let Ok(mut eq) = events_retry.lock() {
+                                eq.push_back(LxmfEvent::MessageDelivered { seq, dest_hex: hex::encode(&dest) });
+                            }
+                        } else {
+                            if let Some(id) = store_id {
+                                if let Some(s) = &store_retry { let _ = s.bump_outbound_attempts(id); }
                             }
                         }
                     }
@@ -634,10 +667,10 @@ impl LxmfNode {
             eq.push_back(LxmfEvent::StatusChanged { running: true, lifecycle: 4 });
         }
 
-        let pending_for_ann = {
+        let (pending_for_ann, peer_ids_arc) = {
             let guard = Self::global().lock().map_err(|e| e.to_string())?;
             let node = guard.as_ref().ok_or("Node not initialized")?;
-            Arc::clone(&node.pending_sends)
+            (Arc::clone(&node.pending_sends), Arc::clone(&node.peer_identities))
         };
         let transport_for_ann = Arc::clone(&transport_arc);
 
@@ -664,6 +697,7 @@ impl LxmfNode {
         let events_ann = Arc::clone(&events);
         let store_ann = store_arc.clone();
         let pending_for_ann_task = Arc::clone(&pending_for_ann);
+        let peer_ids_ann = Arc::clone(&peer_ids_arc);
         let mut announce_rx = announce_rx;
         task_handles.push(rt.spawn(async move {
             let pending_for_ann = pending_for_ann_task;
@@ -671,12 +705,18 @@ impl LxmfNode {
                 match announce_rx.recv().await {
                     Ok(event) => {
                         let dest = event.destination.lock().await;
-                        let hash_bytes = dest.desc.address_hash;
+                        let desc = dest.desc;
+                        let hash_bytes = desc.address_hash;
                         let mut dh = [0u8; 16];
                         dh.copy_from_slice(hash_bytes.as_slice());
                         let app_data = event.app_data.as_slice().to_vec();
                         info!("LxmfNode full: announce from {} ({} hops)", hex::encode(&dh), event.hops);
                         drop(dest);
+
+                        // Cache peer identity for large-payload link sends
+                        if let Ok(mut ids) = peer_ids_ann.lock() {
+                            ids.insert(dh, desc);
+                        }
 
                         let to_retry: Vec<(u64, Option<i64>, Vec<u8>)> = {
                             let mut q = pending_for_ann.lock().unwrap_or_else(|p| p.into_inner());
@@ -690,6 +730,7 @@ impl LxmfNode {
                             use rns_transport::hash::AddressHash;
                             use rns_transport::packet::{Packet, PacketDataBuffer};
                             use rns_transport::transport::SendPacketOutcome;
+                            use rns_transport::delivery::send_via_link;
                             let transport = transport_for_ann.lock().await;
                             for (seq, store_id, payload) in &to_retry {
                                 let mut dest_arr = [0u8; 16];
@@ -701,19 +742,26 @@ impl LxmfNode {
                                 };
                                 let outcome = transport.send_packet_with_outcome(packet).await;
                                 info!("LxmfNode full: opportunistic retry seq={} -> {:?}", seq, outcome);
-                                match outcome {
-                                    SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => {
-                                        if let Some(id) = store_id {
-                                            if let Some(s) = &store_ann { let _ = s.remove_outbound(*id); }
-                                        }
-                                        if let Ok(mut eq) = events_ann.lock() {
-                                            eq.push_back(LxmfEvent::MessageDelivered { seq: *seq, dest_hex: hex::encode(&dh) });
+                                let delivered = match outcome {
+                                    SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => true,
+                                    SendPacketOutcome::DroppedCiphertextTooLarge => {
+                                        match send_via_link(&transport, desc, payload, std::time::Duration::from_secs(15)).await {
+                                            Ok(_) => { info!("LxmfNode full: opportunistic link-send seq={} ok", seq); true }
+                                            Err(e) => { warn!("LxmfNode full: opportunistic link-send seq={} failed: {e}", seq); false }
                                         }
                                     }
-                                    _ => {
-                                        let mut q = pending_for_ann.lock().unwrap_or_else(|p| p.into_inner());
-                                        q.push(PendingSend { seq: *seq, dest: dh, lxmf_payload: payload.clone(), store_id: *store_id });
+                                    _ => false,
+                                };
+                                if delivered {
+                                    if let Some(id) = store_id {
+                                        if let Some(s) = &store_ann { let _ = s.remove_outbound(*id); }
                                     }
+                                    if let Ok(mut eq) = events_ann.lock() {
+                                        eq.push_back(LxmfEvent::MessageDelivered { seq: *seq, dest_hex: hex::encode(&dh) });
+                                    }
+                                } else {
+                                    let mut q = pending_for_ann.lock().unwrap_or_else(|p| p.into_inner());
+                                    q.push(PendingSend { seq: *seq, dest: dh, lxmf_payload: payload.clone(), store_id: *store_id });
                                 }
                             }
                         }
@@ -823,6 +871,7 @@ impl LxmfNode {
         let pending_retry = Arc::clone(&pending_for_ann);
         let store_retry = store_arc.clone();
         let events_retry = Arc::clone(&events);
+        let peer_ids_retry = Arc::clone(&peer_ids_arc);
         task_handles.push(rt.spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -848,6 +897,7 @@ impl LxmfNode {
                     use rns_transport::hash::AddressHash;
                     use rns_transport::packet::{Packet, PacketDataBuffer};
                     use rns_transport::transport::SendPacketOutcome;
+                    use rns_transport::delivery::send_via_link;
                     let transport = transport_retry.lock().await;
                     for (seq, store_id, payload, dest) in snapshot {
                         let packet = Packet {
@@ -856,23 +906,34 @@ impl LxmfNode {
                             ..Default::default()
                         };
                         let outcome = transport.send_packet_with_outcome(packet).await;
-                        match outcome {
-                            SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => {
-                                {
-                                    let mut q = pending_retry.lock().unwrap_or_else(|p| p.into_inner());
-                                    q.retain(|s| s.seq != seq);
-                                }
-                                if let Some(id) = store_id {
-                                    if let Some(s) = &store_retry { let _ = s.remove_outbound(id); }
-                                }
-                                if let Ok(mut eq) = events_retry.lock() {
-                                    eq.push_back(LxmfEvent::MessageDelivered { seq, dest_hex: hex::encode(&dest) });
+                        let delivered = match outcome {
+                            SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => true,
+                            SendPacketOutcome::DroppedCiphertextTooLarge => {
+                                let cached_desc = peer_ids_retry.lock().ok().and_then(|ids| ids.get(&dest).copied());
+                                match cached_desc {
+                                    Some(desc) => match send_via_link(&transport, desc, &payload, std::time::Duration::from_secs(15)).await {
+                                        Ok(_) => { info!("LxmfNode full: periodic link-send seq={} ok", seq); true }
+                                        Err(e) => { warn!("LxmfNode full: periodic link-send seq={} failed: {e}", seq); false }
+                                    },
+                                    None => false,
                                 }
                             }
-                            _ => {
-                                if let Some(id) = store_id {
-                                    if let Some(s) = &store_retry { let _ = s.bump_outbound_attempts(id); }
-                                }
+                            _ => false,
+                        };
+                        if delivered {
+                            {
+                                let mut q = pending_retry.lock().unwrap_or_else(|p| p.into_inner());
+                                q.retain(|s| s.seq != seq);
+                            }
+                            if let Some(id) = store_id {
+                                if let Some(s) = &store_retry { let _ = s.remove_outbound(id); }
+                            }
+                            if let Ok(mut eq) = events_retry.lock() {
+                                eq.push_back(LxmfEvent::MessageDelivered { seq, dest_hex: hex::encode(&dest) });
+                            }
+                        } else {
+                            if let Some(id) = store_id {
+                                if let Some(s) = &store_retry { let _ = s.bump_outbound_attempts(id); }
                             }
                         }
                     }
@@ -911,7 +972,7 @@ impl LxmfNode {
         use rns_transport::packet::{Packet, PacketDataBuffer};
         use rns_transport::transport::SendPacketOutcome;
 
-        let (transport, identity_bytes, source_hash_bytes, seq, pending_sends, events, store) = {
+        let (transport, identity_bytes, source_hash_bytes, seq, pending_sends, events, store, peer_identities) = {
             let mut guard = Self::global().lock().map_err(|e| e.to_string())?;
             let node = guard.as_mut().ok_or("Node not initialized")?;
             let transport = node.transport.clone().ok_or("Transport not started (mode 3 only)")?;
@@ -923,7 +984,8 @@ impl LxmfNode {
             let pending = Arc::clone(&node.pending_sends);
             let events = Arc::clone(&node.events);
             let store = node.store.clone();
-            (transport, id_bytes, src, seq, pending, events, store)
+            let peer_ids = Arc::clone(&node.peer_identities);
+            (transport, id_bytes, src, seq, pending, events, store, peer_ids)
         };
 
         let dest_bytes = hex::decode(dest_hex)
@@ -968,6 +1030,7 @@ impl LxmfNode {
             ..Default::default()
         };
 
+        let transport_for_link = Arc::clone(&transport);
         let outcome = get_runtime().block_on(async move {
             let transport = transport.lock().await;
             transport.send_packet_with_outcome(packet).await
@@ -1005,7 +1068,53 @@ impl LxmfNode {
                 Ok(seq)
             }
             SendPacketOutcome::DroppedCiphertextTooLarge => {
-                Err("message payload too large after encryption".to_string())
+                // Large payload (e.g. image attachment). Try link + resource transfer.
+                // Requires peer identity from announce cache; if absent, queue for retry.
+                let cached_desc = peer_identities.lock().ok().and_then(|ids| ids.get(&dest_arr).copied());
+                match cached_desc {
+                    Some(desc) => {
+                        use rns_transport::delivery::send_via_link;
+                        info!("LxmfNode::send_to: seq={} large payload {}B — trying link send", seq, lxmf_payload.len());
+                        let payload_for_link = lxmf_payload.clone();
+                        let result = get_runtime().block_on(async move {
+                            let transport = transport_for_link.lock().await;
+                            send_via_link(&transport, desc, &payload_for_link, std::time::Duration::from_secs(15)).await
+                        });
+                        match result {
+                            Ok(_) => {
+                                info!("LxmfNode::send_to: link-send seq={} ok", seq);
+                                Ok(seq)
+                            }
+                            Err(e) => {
+                                warn!("LxmfNode::send_to: link-send seq={seq} failed: {e:?}, queuing");
+                                let store_id = store.as_ref().and_then(|s| {
+                                    s.enqueue_outbound(seq, &dest_arr, &lxmf_payload).ok()
+                                });
+                                if let Ok(mut q) = pending_sends.lock() {
+                                    q.push(PendingSend { seq, dest: dest_arr, lxmf_payload, store_id });
+                                }
+                                if let Ok(mut eq) = events.lock() {
+                                    eq.push_back(LxmfEvent::MessageQueued { seq, dest_hex: dest_hex.to_string() });
+                                }
+                                Ok(seq)
+                            }
+                        }
+                    }
+                    None => {
+                        // No identity cached yet — queue; will retry via link when peer announces
+                        warn!("LxmfNode::send_to: seq={} large payload, no identity cached for {dest_hex}, queuing", seq);
+                        let store_id = store.as_ref().and_then(|s| {
+                            s.enqueue_outbound(seq, &dest_arr, &lxmf_payload).ok()
+                        });
+                        if let Ok(mut q) = pending_sends.lock() {
+                            q.push(PendingSend { seq, dest: dest_arr, lxmf_payload, store_id });
+                        }
+                        if let Ok(mut eq) = events.lock() {
+                            eq.push_back(LxmfEvent::MessageQueued { seq, dest_hex: dest_hex.to_string() });
+                        }
+                        Ok(seq)
+                    }
+                }
             }
             SendPacketOutcome::DroppedEncryptFailed => {
                 Err(format!("failed to encrypt packet for /{dest_hex}/"))
