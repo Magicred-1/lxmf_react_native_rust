@@ -443,10 +443,32 @@ fn events_to_json(events: &[crate::node::LxmfEvent]) -> String {
             "type": "beaconDiscovered", "destHash": hex::encode(dest_hash),
             "appData": String::from_utf8_lossy(app_data).to_string(),
         }),
-        LxmfEvent::MessageReceived { source, content, timestamp } => serde_json::json!({
-            "type": "messageReceived", "source": hex::encode(source),
-            "content": hex::encode(content), "timestamp": timestamp,
-        }),
+        LxmfEvent::MessageReceived { source, title, body, image, files, timestamp } => {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let mut obj = serde_json::json!({
+                "type": "messageReceived",
+                "source": hex::encode(source),
+                "title": b64.encode(title),
+                "body": b64.encode(body),
+                "timestamp": timestamp,
+            });
+            if let Some((mime, data)) = image {
+                obj["image"] = serde_json::json!({
+                    "mimeType": mime,
+                    "data": b64.encode(data),
+                });
+            }
+            if !files.is_empty() {
+                obj["files"] = serde_json::Value::Array(
+                    files.iter().map(|(name, data)| serde_json::json!({
+                        "name": name,
+                        "data": b64.encode(data),
+                    })).collect()
+                );
+            }
+            obj
+        }
         LxmfEvent::AnnounceReceived { dest_hash, app_data, hops } => serde_json::json!({
             "type": "announceReceived", "destHash": hex::encode(dest_hash),
             "appData": String::from_utf8_lossy(app_data).to_string(), "hops": hops,

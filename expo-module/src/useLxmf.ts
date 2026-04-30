@@ -23,6 +23,16 @@ export interface Beacon {
   reconnectAttempts: number;
 }
 
+export interface LxmfMessageEvent {
+  type: 'messageReceived';
+  source: string;
+  title: string;       // base64
+  body: string;        // base64
+  timestamp: number;
+  image?: { mimeType: string; data: string };  // data = base64
+  files?: { name: string; data: string }[];    // data = base64
+}
+
 export interface LxmfEvent {
   type: 'statusChanged' | 'packetReceived' | 'txReceived' | 'beaconDiscovered' | 'messageReceived' | 'announceReceived' | 'log' | 'error';
   [key: string]: any;

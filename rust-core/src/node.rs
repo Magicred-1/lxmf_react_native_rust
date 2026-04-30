@@ -36,7 +36,14 @@ pub enum LxmfEvent {
     PacketReceived { source: DestHash, data: Vec<u8> },
     TxReceived { data: Vec<u8> },
     BeaconDiscovered { dest_hash: DestHash, app_data: Vec<u8> },
-    MessageReceived { source: LxmfAddress, content: Vec<u8>, timestamp: u64 },
+    MessageReceived {
+        source: LxmfAddress,
+        title: Vec<u8>,
+        body: Vec<u8>,
+        image: Option<(String, Vec<u8>)>,
+        files: Vec<(String, Vec<u8>)>,
+        timestamp: u64,
+    },
     AnnounceReceived { dest_hash: DestHash, app_data: Vec<u8>, hops: u8 },
     Log { level: u32, message: String },
     Error { code: u32, message: String },
@@ -364,14 +371,7 @@ impl LxmfNode {
                         let data = received.data.as_slice().to_vec();
                         info!("LxmfNode: received {} bytes from {}", data.len(), hex::encode(&src));
                         if let Ok(mut eq) = events_data.lock() {
-                            eq.push_back(LxmfEvent::MessageReceived {
-                                source: src,
-                                content: data,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                            });
+                            eq.push_back(lxmf_event_from_bytes(src, data));
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -395,14 +395,7 @@ impl LxmfNode {
                             let data = complete.data;
                             info!("LxmfNode: resource complete {} bytes from {}", data.len(), hex::encode(&src));
                             if let Ok(mut eq) = events_res.lock() {
-                                eq.push_back(LxmfEvent::MessageReceived {
-                                    source: src,
-                                    content: data,
-                                    timestamp: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                });
+                                eq.push_back(lxmf_event_from_bytes(src, data));
                             }
                         }
                     }
@@ -610,14 +603,7 @@ impl LxmfNode {
                         let data = received.data.as_slice().to_vec();
                         info!("LxmfNode full: received {} bytes from {}", data.len(), hex::encode(&src));
                         if let Ok(mut eq) = events_data.lock() {
-                            eq.push_back(LxmfEvent::MessageReceived {
-                                source: src,
-                                content: data,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                            });
+                            eq.push_back(lxmf_event_from_bytes(src, data));
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -641,14 +627,7 @@ impl LxmfNode {
                             let data = complete.data;
                             info!("LxmfNode full: resource complete {} bytes from {}", data.len(), hex::encode(&src));
                             if let Ok(mut eq) = events_res.lock() {
-                                eq.push_back(LxmfEvent::MessageReceived {
-                                    source: src,
-                                    content: data,
-                                    timestamp: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                });
+                                eq.push_back(lxmf_event_from_bytes(src, data));
                             }
                         }
                     }
@@ -944,14 +923,7 @@ impl LxmfNode {
                         let data = received.data.as_slice().to_vec();
                         info!("LxmfNode BLE: received {} bytes", data.len());
                         if let Ok(mut eq) = events_data.lock() {
-                            eq.push_back(LxmfEvent::MessageReceived {
-                                source: src,
-                                content: data,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                            });
+                            eq.push_back(lxmf_event_from_bytes(src, data));
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1150,6 +1122,144 @@ impl LxmfNode {
     pub fn abi_version() -> u32 {
         2 // v2 = rns-transport based
     }
+}
+
+/// Decode an inbound LXMF wire payload and return a MessageReceived event.
+/// Falls back to raw body if the payload cannot be parsed.
+fn lxmf_event_from_bytes(src: LxmfAddress, data: Vec<u8>) -> LxmfEvent {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(dec) = decode_lxmf_payload(&data) {
+        LxmfEvent::MessageReceived {
+            source: src, title: dec.title, body: dec.body,
+            image: dec.image, files: dec.files, timestamp: ts,
+        }
+    } else {
+        LxmfEvent::MessageReceived {
+            source: src, title: vec![], body: data,
+            image: None, files: vec![], timestamp: ts,
+        }
+    }
+}
+
+struct DecodedLxmf {
+    title: Vec<u8>,
+    body: Vec<u8>,
+    image: Option<(String, Vec<u8>)>,
+    files: Vec<(String, Vec<u8>)>,
+}
+
+/// Parse an LXMF wire payload.
+/// Format: [16B dest][16B src][64B sig][msgpack([f64 ts, bin title, bin body, map fields])]
+fn decode_lxmf_payload(data: &[u8]) -> Option<DecodedLxmf> {
+    if data.len() < 97 { return None; }
+    let mp = &data[96..];
+    if mp.first() != Some(&0x94) { return None; } // fixarray(4)
+    let mut pos = 1usize;
+    if mp.get(pos) != Some(&0xcb) { return None; } // float64 timestamp
+    pos += 9;
+    let title = mp_read_bytes(mp, &mut pos).unwrap_or_default();
+    let body  = mp_read_bytes(mp, &mut pos).unwrap_or_default();
+    let (image, files) = mp_read_lxmf_fields(mp, &mut pos);
+    Some(DecodedLxmf { title, body, image, files })
+}
+
+fn mp_read_bytes(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    let b = *data.get(*pos)?; *pos += 1;
+    let len: usize = match b {
+        0xc4 => { let l = *data.get(*pos)? as usize; *pos += 1; l }
+        0xc5 => mp_u16(data, pos)?,
+        0xc6 => mp_u32(data, pos)?,
+        b if b & 0xe0 == 0xa0 => (b & 0x1f) as usize,
+        0xd9 => { let l = *data.get(*pos)? as usize; *pos += 1; l }
+        0xda => mp_u16(data, pos)?,
+        _ => return None,
+    };
+    let bytes = data.get(*pos..*pos + len)?.to_vec();
+    *pos += len;
+    Some(bytes)
+}
+
+fn mp_u16(data: &[u8], pos: &mut usize) -> Option<usize> {
+    let v = ((*data.get(*pos)? as usize) << 8) | (*data.get(*pos + 1)? as usize);
+    *pos += 2; Some(v)
+}
+
+fn mp_u32(data: &[u8], pos: &mut usize) -> Option<usize> {
+    let v = ((*data.get(*pos)? as usize) << 24) | ((*data.get(*pos+1)? as usize) << 16)
+          | ((*data.get(*pos+2)? as usize) << 8) | (*data.get(*pos+3)? as usize);
+    *pos += 4; Some(v)
+}
+
+fn mp_read_array_len(data: &[u8], pos: &mut usize) -> Option<usize> {
+    let b = *data.get(*pos)?; *pos += 1;
+    match b {
+        b if b & 0xf0 == 0x90 => Some((b & 0x0f) as usize),
+        0xdc => mp_u16(data, pos),
+        0xdd => mp_u32(data, pos),
+        _ => None,
+    }
+}
+
+fn mp_skip(data: &[u8], pos: &mut usize) {
+    let b = match data.get(*pos) { Some(&b) => { *pos += 1; b } None => return };
+    match b {
+        0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => {}
+        0xca | 0xce | 0xd2 => { *pos = pos.saturating_add(4); }
+        0xcb | 0xcf | 0xd3 => { *pos = pos.saturating_add(8); }
+        0xcc | 0xd0 => { *pos = pos.saturating_add(1); }
+        0xcd | 0xd1 => { *pos = pos.saturating_add(2); }
+        b if b & 0xe0 == 0xa0 => { *pos = pos.saturating_add((b & 0x1f) as usize); }
+        0xd9 | 0xc4 => { if let Some(&l) = data.get(*pos) { *pos += 1 + l as usize; } }
+        0xda | 0xc5 | 0xdc => { if let Some(n) = mp_u16(data, pos) { *pos += n; } }
+        0xdb | 0xc6 | 0xdd => { if let Some(n) = mp_u32(data, pos) { *pos += n; } }
+        b if b & 0xf0 == 0x90 => { let n = (b & 0x0f) as usize; for _ in 0..n { mp_skip(data, pos); } }
+        b if b & 0xf0 == 0x80 => { let n = (b & 0x0f) as usize; for _ in 0..n { mp_skip(data, pos); mp_skip(data, pos); } }
+        0xde => { if let Some(n) = mp_u16(data, pos) { for _ in 0..n { mp_skip(data, pos); mp_skip(data, pos); } } }
+        _ => {}
+    }
+}
+
+fn mp_read_lxmf_fields(data: &[u8], pos: &mut usize) -> (Option<(String, Vec<u8>)>, Vec<(String, Vec<u8>)>) {
+    let mut image: Option<(String, Vec<u8>)> = None;
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let b = match data.get(*pos) { Some(&b) => { *pos += 1; b } None => return (image, files) };
+    let map_len: usize = match b {
+        b if b & 0xf0 == 0x80 => (b & 0x0f) as usize,
+        0xde => match mp_u16(data, pos) { Some(n) => n, None => return (image, files) },
+        _ => return (image, files),
+    };
+    for _ in 0..map_len {
+        let key = match data.get(*pos) {
+            Some(&k) if k < 0x80 => { *pos += 1; k }
+            _ => break,
+        };
+        match key {
+            0x06 => { // FIELD_IMAGE: fixarray(2) [mime_str, data_bin]
+                if data.get(*pos).copied() == Some(0x92) {
+                    *pos += 1;
+                    if let (Some(m), Some(d)) = (mp_read_bytes(data, pos), mp_read_bytes(data, pos)) {
+                        image = Some((String::from_utf8(m).unwrap_or_else(|_| "image/jpeg".into()), d));
+                    }
+                } else { mp_skip(data, pos); }
+            }
+            0x05 => { // FIELD_FILE_ATTACHMENTS: array [ fixarray(2) [name, data], ... ]
+                let n = mp_read_array_len(data, pos).unwrap_or(0);
+                for _ in 0..n {
+                    if data.get(*pos).copied() == Some(0x92) {
+                        *pos += 1;
+                        if let (Some(nb), Some(fd)) = (mp_read_bytes(data, pos), mp_read_bytes(data, pos)) {
+                            files.push((String::from_utf8(nb).unwrap_or_else(|_| "file".into()), fd));
+                        }
+                    } else { mp_skip(data, pos); }
+                }
+            }
+            _ => { mp_skip(data, pos); }
+        }
+    }
+    (image, files)
 }
 
 /// Build announce app_data.
