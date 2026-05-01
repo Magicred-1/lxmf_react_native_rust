@@ -144,6 +144,10 @@ class LxmfModule : Module() {
     Function("blePeerCount") {
       nativeBlePeerCount()
     }
+
+    Function("bleUnpairedRNodeCount") {
+      bleManager?.unpairedRNodeCount() ?: 0
+    }
   }
 
   private fun drainAndEmitEvents() {
