@@ -4,3 +4,6 @@ mod media_fields;
 mod beacon_announce;
 mod interface_parsing;
 mod event_decode;
+mod store_persist;
+mod lxmf_wire;
+mod node_queue;
