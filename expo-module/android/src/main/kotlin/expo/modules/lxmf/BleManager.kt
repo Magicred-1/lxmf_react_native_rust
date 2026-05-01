@@ -48,8 +48,6 @@ class BleManager(
     private val connecting = mutableSetOf<String>()
     // Timestamp (ms) when each MAC last disconnected — enforces reconnect cooldown
     private val disconnectedAt = mutableMapOf<String, Long>()
-    // MACs seen in scan results but not yet GATT-connected (mirrors iOS discoveredUnpairedRNodes)
-    private val discoveredUnpaired = mutableSetOf<String>()
 
     private var scanner: BluetoothLeScanner? = null
     private var advertiser: BluetoothLeAdvertiser? = null
@@ -115,12 +113,10 @@ class BleManager(
         connections.values.forEach { it.disconnect(); it.close() }
         connections.clear()
         connecting.clear()
-        discoveredUnpaired.clear()
         Log.i(TAG, "BleManager stopped")
     }
 
     fun connectedPeerCount(): Int = module.nativeBlePeerCount()
-    fun unpairedRNodeCount(): Int = discoveredUnpaired.size
 
     // ── Advertising (so peers can find us) ───────────────────────────────────
 
@@ -396,7 +392,6 @@ class BleManager(
             val lastDisconnect = disconnectedAt[mac] ?: 0L
             if (System.currentTimeMillis() - lastDisconnect < RECONNECT_COOLDOWN_MS) return
             Log.i(TAG, "BLE: found peer $mac, connecting")
-            discoveredUnpaired.add(mac)
             connecting.add(mac)
             device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         }
@@ -418,7 +413,6 @@ class BleManager(
                     Log.i(TAG, "BLE GATT connected: $mac")
                     connections[mac] = gatt
                     connecting.remove(mac)
-                    discoveredUnpaired.remove(mac)
                     gatt.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -427,7 +421,6 @@ class BleManager(
                     Log.i(TAG, "BLE GATT disconnected: $mac (status=$status)")
                     connections.remove(mac)
                     connecting.remove(mac)
-                    discoveredUnpaired.remove(mac)
                     disconnectedAt[mac] = System.currentTimeMillis()
                     gatt.close()
                     // Notify Rust

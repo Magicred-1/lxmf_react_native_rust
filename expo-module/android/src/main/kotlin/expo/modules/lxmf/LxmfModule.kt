@@ -15,12 +15,13 @@ class LxmfModule : Module() {
   private val pollRunnable = object : Runnable {
     override fun run() {
       drainAndEmitEvents()
+      nusManager?.pollTxAndWrite()
       pollHandler.postDelayed(this, POLL_INTERVAL_MS)
     }
   }
 
-  // BleManager is created lazily when the app context is available
   private var bleManager: BleManager? = null
+  private var nusManager: NusManager? = null
 
   override fun definition() = ModuleDefinition {
     Name("LxmfModule")
@@ -48,6 +49,7 @@ class LxmfModule : Module() {
         ?: appContext.currentActivity?.applicationContext
       if (ctx != null) {
         bleManager = BleManager(ctx, this@LxmfModule)
+        nusManager = NusManager(ctx, this@LxmfModule)
       }
     }
 
@@ -55,6 +57,8 @@ class LxmfModule : Module() {
       pollHandler.removeCallbacks(pollRunnable)
       bleManager?.stop()
       bleManager = null
+      nusManager?.stop()
+      nusManager = null
     }
 
     // Lifecycle
@@ -79,11 +83,13 @@ class LxmfModule : Module() {
                   bleMtuHint.toShort(), interfacesJson, displayName, isBeacon)
       if (rc != 0) throw RuntimeException("nativeStart returned $rc")
       bleManager?.start()
+      nusManager?.start()
       true
     }
 
     AsyncFunction("stop") {
       bleManager?.stop()
+      nusManager?.stop()
       val rc = nativeStop()
       if (rc != 0) throw RuntimeException("nativeStop returned $rc")
       true
@@ -134,12 +140,14 @@ class LxmfModule : Module() {
     Function("startBLE") {
       Log.d(TAG, "startBLE()")
       bleManager?.start()
+      nusManager?.start()
       true
     }
 
     Function("stopBLE") {
       Log.d(TAG, "stopBLE()")
       bleManager?.stop()
+      nusManager?.stop()
       true
     }
 
@@ -148,7 +156,7 @@ class LxmfModule : Module() {
     }
 
     Function("bleUnpairedRNodeCount") {
-      bleManager?.unpairedRNodeCount() ?: 0
+      nusManager?.unpairedRNodeCount() ?: 0
     }
   }
 
@@ -216,6 +224,10 @@ class LxmfModule : Module() {
   private external fun nativeFetchMessages(limit: Int): String?
   private external fun nativeSetLogLevel(level: Int): Int
   private external fun nativeAbiVersion(): Int
+
+  // NUS JNI — called by NusManager (same package)
+  external fun nativeNusReceive(data: ByteArray)
+  external fun nativeNusPollTx(): ByteArray?
 
   // BLE JNI — called by BleManager (same package)
   // Must NOT be `internal` — Kotlin mangles internal function names in JVM bytecode,

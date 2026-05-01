@@ -2,7 +2,7 @@
 
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jint, jlong, jboolean, jshort, jstring};
+use jni::sys::{jint, jlong, jboolean, jshort, jstring, jbyteArray};
 use log::error;
 use serde_json;
 
@@ -422,6 +422,38 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBlePeerCount(
     _class: JClass,
 ) -> jint {
     ble_iface::ble_peer_count() as jint
+}
+
+// --- NUS Interface (RNode BLE via Nordic UART Service) ---
+
+/// Called by Kotlin NusManager when a NUS RX notification arrives from an RNode.
+/// `data` — raw bytes from the NUS RX characteristic notification (partial KISS frame OK).
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeNusReceive(
+    mut env: JNIEnv,
+    _class: JClass,
+    data: JByteArray,
+) {
+    match jbytes_to_vec(&mut env, &data) {
+        Ok(bytes) => crate::nus_iface::on_nus_rx(bytes),
+        Err(e) => error!("nativeNusReceive: failed to read data: {}", e),
+    }
+}
+
+/// Called by Kotlin NusManager to dequeue the next KISS-framed bytes to write to the
+/// RNode's NUS TX characteristic. Returns null when the queue is empty.
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeNusPollTx(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jbyteArray {
+    match crate::nus_iface::next_nus_tx() {
+        None => std::ptr::null_mut(),
+        Some(data) => match env.byte_array_from_slice(&data) {
+            Ok(arr) => arr.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+    }
 }
 
 /// Called by Kotlin after ATT MTU negotiation completes for a peer.
