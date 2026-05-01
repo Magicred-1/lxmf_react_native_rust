@@ -1,0 +1,258 @@
+import { useCallback, useEffect, useState } from 'react';
+import {
+  PermissionsAndroid,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Switch,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import { LxmfModule, LxmfNodeMode } from '@magicred-1/react-native-lxmf';
+import { useLxmfContext } from '@/context/LxmfContext';
+
+function shortHex(v: string): string {
+  if (!v || v.length <= 12) return v || '—';
+  return `${v.slice(0, 6)}…${v.slice(-6)}`;
+}
+
+type TransportTab = 'ble' | 'tcp' | 'both';
+
+// ── Stat row ──────────────────────────────────────────────────────────────────
+
+function Row({ label, value }: Readonly<{ label: string; value: string }>) {
+  return (
+    <View style={S.statRow}>
+      <Text style={S.statLabel}>{label}</Text>
+      <Text selectable style={S.statValue}>{value}</Text>
+    </View>
+  );
+}
+
+// ── Main screen ───────────────────────────────────────────────────────────────
+
+export default function NetworkScreen() {
+  const { isRunning, isNativeAvailable, status, error, identityHydrated, displayName, start, stop, getStatus } = useLxmfContext();
+
+  const [tab, setTab] = useState<TransportTab>('both');
+  const [tcpHost, setTcpHost] = useState('192.168.1.135');
+  const [tcpPort, setTcpPort] = useState('4243');
+  const [localName, setLocalName] = useState(displayName);
+  const [isBeacon, setIsBeacon] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [bleCount, setBleCount] = useState(0);
+  const [unpairedCount, setUnpairedCount] = useState(0);
+
+  // Poll BLE peer count while running
+  useEffect(() => {
+    if (!isRunning) { setBleCount(0); setUnpairedCount(0); return; }
+    const tick = () => {
+      try { setBleCount(LxmfModule.blePeerCount()); } catch {}
+      try { setUnpairedCount(LxmfModule.bleUnpairedRNodeCount()); } catch {}
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => clearInterval(id);
+  }, [isRunning]);
+
+  // Auto-refresh status
+  useEffect(() => {
+    if (!isRunning) return;
+    const id = setInterval(getStatus, 5000);
+    return () => clearInterval(id);
+  }, [isRunning, getStatus]);
+
+  const requestBlePerms = async (): Promise<boolean> => {
+    if (Platform.OS !== 'android') return true;
+    const perms = Platform.Version >= 31
+      ? [PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN, PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE, PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT]
+      : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+    const res = await PermissionsAndroid.requestMultiple(perms);
+    if (Object.values(res).some(r => r !== PermissionsAndroid.RESULTS.GRANTED)) {
+      setMsg('BLE permissions denied.');
+      return false;
+    }
+    return true;
+  };
+
+  const onStart = useCallback(async () => {
+    setMsg('');
+    const name = localName.trim() || 'lxmf-mobile';
+
+    if (tab === 'ble') {
+      if (!await requestBlePerms()) return;
+      const ok = await start({ mode: LxmfNodeMode.BleOnly, displayName: name, isBeacon });
+      if (!ok) setMsg('Failed to start BLE node.');
+    } else {
+      const host = tcpHost.trim();
+      const port = Number(tcpPort);
+      if (!host) { setMsg('Host required.'); return; }
+      if (!Number.isInteger(port) || port < 1 || port > 65535) { setMsg('Port must be 1–65535.'); return; }
+      if (tab === 'both' && !await requestBlePerms()) return;
+      const mode = tab === 'tcp' ? LxmfNodeMode.Reticulum : LxmfNodeMode.ReticulumAndBle;
+      const ok = await start({ mode, tcpInterfaces: [{ host, port }], displayName: name, isBeacon });
+      if (!ok) setMsg('Failed to start node.');
+    }
+  }, [tab, tcpHost, tcpPort, localName, isBeacon, start]);
+
+  const onStop = useCallback(async () => {
+    await stop();
+    setMsg('');
+  }, [stop]);
+
+  const modeLabel = (m: number) => ['BLE', 'TCP', 'TCP Server', 'Reticulum', 'Reticulum+BLE'][m] ?? String(m);
+
+  const hasTcp = tab !== 'ble';
+
+  return (
+    <ScrollView style={S.root} contentContainerStyle={S.scroll}>
+      <View style={S.header}>
+        <Text style={S.headerTitle}>Network</Text>
+      </View>
+
+      {/* Error banner */}
+      {error ? <View style={S.errorBanner}><Text style={S.errorText}>{error}</Text></View> : null}
+
+      {/* ── Transport card ───────────────────────────────────────────── */}
+      <View style={S.card}>
+        <Text style={S.cardTitle}>Transport</Text>
+
+        {/* Segment control */}
+        <View style={S.segment}>
+          {(['ble', 'tcp', 'both'] as TransportTab[]).map(t => (
+            <Pressable
+              key={t}
+              style={[S.segBtn, tab === t && S.segBtnActive]}
+              onPress={() => { setTab(t); setMsg(''); }}
+              disabled={isRunning}>
+              <Text style={[S.segText, tab === t && S.segTextActive]}>
+                {t === 'ble' ? 'BLE' : t === 'tcp' ? 'TCP' : 'TCP+BLE'}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+
+        {/* TCP fields */}
+        {hasTcp && (
+          <>
+            <TextInput style={S.input} placeholder="Host" placeholderTextColor="#4a6070"
+              value={tcpHost} onChangeText={setTcpHost} autoCapitalize="none" autoCorrect={false} editable={!isRunning} />
+            <TextInput style={S.input} placeholder="Port" placeholderTextColor="#4a6070"
+              value={tcpPort} onChangeText={setTcpPort} keyboardType="number-pad" editable={!isRunning} />
+          </>
+        )}
+
+        {/* Display name */}
+        <TextInput style={S.input} placeholder="Display name" placeholderTextColor="#4a6070"
+          value={localName} onChangeText={setLocalName} autoCapitalize="none" autoCorrect={false} editable={!isRunning} />
+
+        {/* Beacon toggle */}
+        <View style={S.switchRow}>
+          <Text style={S.switchLabel}>Beacon mode</Text>
+          <Switch
+            value={isBeacon} onValueChange={setIsBeacon} disabled={isRunning}
+            trackColor={{ false: '#1e3040', true: '#1a7fc1' }}
+            thumbColor={isBeacon ? '#4fb3e8' : '#4a6070'}
+          />
+        </View>
+
+        {msg ? <Text style={S.warn}>{msg}</Text> : null}
+
+        {unpairedCount > 0 && (
+          <Text style={S.warn}>
+            {unpairedCount} unpaired RNode{unpairedCount > 1 ? 's' : ''} nearby — pair in Settings &gt; Bluetooth first.
+          </Text>
+        )}
+
+        <View style={S.btnRow}>
+          <Pressable
+            style={({ pressed }) => [S.btn, (!isNativeAvailable || isRunning || !identityHydrated) && S.btnDisabled, pressed && S.btnPressed]}
+            onPress={onStart}
+            disabled={!isNativeAvailable || isRunning || !identityHydrated}>
+            <Text style={S.btnText}>Start</Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [S.btn, S.btnDanger, !isRunning && S.btnDisabled, pressed && S.btnPressed]}
+            onPress={onStop}
+            disabled={!isRunning}>
+            <Text style={S.btnText}>Stop</Text>
+          </Pressable>
+        </View>
+      </View>
+
+      {/* ── Node Status card ─────────────────────────────────────────── */}
+      <View style={S.card}>
+        <View style={S.cardTitleRow}>
+          <Text style={S.cardTitle}>Node Status</Text>
+          <Pressable style={({ pressed }) => [S.refreshBtn, pressed && { opacity: 0.7 }]} onPress={getStatus}>
+            <Text style={S.refreshText}>↻ Refresh</Text>
+          </Pressable>
+        </View>
+
+        <Row label="State" value={isRunning ? '● Running' : '○ Stopped'} />
+        <Row label="Mode" value={status ? modeLabel(status.mode) : '—'} />
+        <Row label="Address" value={status?.addressHex ? shortHex(status.addressHex) : '—'} />
+        <Row label="BLE peers" value={String(bleCount)} />
+        <Row label="Pending outbound" value={String(status?.pendingOutbound ?? 0)} />
+        <Row label="Messages sent" value={String(status?.outboundSent ?? 0)} />
+        <Row label="Messages received" value={String(status?.lxmfMessagesReceived ?? 0)} />
+        <Row label="Announces received" value={String(status?.announcesReceived ?? 0)} />
+        <Row label="Inbound accepted" value={String(status?.inboundAccepted ?? 0)} />
+      </View>
+    </ScrollView>
+  );
+}
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+
+const S = StyleSheet.create({
+  root: { flex: 1, backgroundColor: '#0c1218' },
+  scroll: { paddingBottom: 40, gap: 12 },
+
+  header: {
+    paddingHorizontal: 16, paddingTop: 56, paddingBottom: 14,
+    backgroundColor: '#131d26', borderBottomWidth: 1, borderBottomColor: '#1e3040',
+  },
+  headerTitle: { color: '#d8ecf8', fontSize: 28, fontWeight: '700' },
+
+  errorBanner: { backgroundColor: '#3a1515', borderWidth: 1, borderColor: '#7a2020', padding: 10, marginHorizontal: 14, borderRadius: 10 },
+  errorText: { color: '#ff9a9a', fontSize: 13 },
+
+  card: {
+    backgroundColor: '#131d26', borderRadius: 14, borderWidth: 1,
+    borderColor: '#1e3040', padding: 16, gap: 10, marginHorizontal: 14,
+  },
+  cardTitle: { color: '#d8ecf8', fontSize: 16, fontWeight: '700' },
+  cardTitleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  refreshBtn: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 8, backgroundColor: '#0d3550', borderWidth: 1, borderColor: '#1e3040' },
+  refreshText: { color: '#4fb3e8', fontSize: 12, fontWeight: '600' },
+
+  segment: { flexDirection: 'row', borderRadius: 10, borderWidth: 1, borderColor: '#1e3040', overflow: 'hidden' },
+  segBtn: { flex: 1, paddingVertical: 9, alignItems: 'center', backgroundColor: '#0e1923' },
+  segBtnActive: { backgroundColor: '#0d3550' },
+  segText: { color: '#4a6070', fontSize: 13, fontWeight: '600' },
+  segTextActive: { color: '#4fb3e8' },
+
+  input: {
+    borderWidth: 1, borderColor: '#2a4050', backgroundColor: '#0b1820', color: '#d8ecf8',
+    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, fontFamily: 'monospace', fontSize: 13,
+  },
+
+  switchRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 2 },
+  switchLabel: { color: '#7a9db5', fontSize: 13 },
+
+  warn: { color: '#f0a500', fontSize: 12, fontFamily: 'monospace' },
+
+  btnRow: { flexDirection: 'row', gap: 8 },
+  btn: { flex: 1, borderRadius: 10, paddingVertical: 11, alignItems: 'center', backgroundColor: '#1a7fc1' },
+  btnDanger: { backgroundColor: '#c0392b' },
+  btnDisabled: { opacity: 0.4 },
+  btnPressed: { opacity: 0.75 },
+  btnText: { color: '#e8f6ff', fontSize: 14, fontWeight: '600' },
+
+  statRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 2 },
+  statLabel: { color: '#7a9db5', fontSize: 13 },
+  statValue: { color: '#d8ecf8', fontSize: 13, fontFamily: 'monospace' },
+});

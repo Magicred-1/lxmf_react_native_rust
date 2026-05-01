@@ -1,0 +1,283 @@
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import * as SecureStore from 'expo-secure-store';
+import {
+  useLxmf,
+  LxmfModule,
+  LxmfNodeMode,
+  type LxmfEvent,
+  type LxmfMedia,
+  type LxmfNodeStatus,
+  type LxmfMessageEvent,
+} from '@magicred-1/react-native-lxmf';
+
+// ── Persistence keys ─────────────────────────────────────────────────────────
+
+const IDENTITY_KEY = 'lxmf.identity.v1';
+const CONTACTS_KEY = 'lxmf.contacts.v1';
+const DISPLAY_NAME_KEY = 'lxmf.displayName';
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export type StoredIdentity = {
+  version: number;
+  identity_hex: string;
+  address_hex: string;
+  created_at: string;
+};
+
+export type Contact = {
+  address: string;
+  name: string;
+  lastSeen: number;
+  lastMessage: string;
+  unread: number;
+};
+
+export type StoredMessage = {
+  id: number;
+  source: string;
+  dest: string;
+  title: string;
+  body: string;
+  outbound: boolean;
+  timestamp: number;
+  acked: boolean;
+  image?: { mimeType: string; data: string };
+  files?: { name: string; data: string }[];
+};
+
+// ── Context value ─────────────────────────────────────────────────────────────
+
+export type LxmfContextValue = {
+  isNativeAvailable: boolean;
+  isRunning: boolean;
+  status: LxmfNodeStatus | null;
+  error: string | null;
+  events: LxmfEvent[];
+  start: (overrides?: {
+    identityHex?: string;
+    lxmfAddressHex?: string;
+    mode?: LxmfNodeMode;
+    tcpInterfaces?: { host: string; port: number }[];
+    displayName?: string;
+    isBeacon?: boolean;
+  }) => Promise<boolean>;
+  stop: () => Promise<void>;
+  send: (dest: string, body: string, media?: LxmfMedia) => Promise<number>;
+  broadcast: (dests: string[], body: string, media?: LxmfMedia) => Promise<number>;
+  fetchMessages: (limit?: number) => StoredMessage[];
+  getStatus: () => LxmfNodeStatus | null;
+  getIdentityHex: () => string | null;
+  bleUnpairedRNodeCount: () => number;
+  setLogLevel: (level: number) => void;
+  // Identity
+  identity: StoredIdentity | null;
+  identityHydrated: boolean;
+  clearIdentity: () => Promise<void>;
+  // Display name
+  displayName: string;
+  setDisplayName: (name: string) => void;
+  // Contacts
+  contacts: Contact[];
+  upsertContact: (address: string, opts?: { name?: string; lastMessage?: string }) => void;
+  markRead: (address: string) => void;
+};
+
+const LxmfContext = createContext<LxmfContextValue | null>(null);
+
+export function useLxmfContext(): LxmfContextValue {
+  const ctx = useContext(LxmfContext);
+  if (!ctx) throw new Error('useLxmfContext must be used within LxmfProvider');
+  return ctx;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function isValidIdentity(b: unknown): b is StoredIdentity {
+  if (!b || typeof b !== 'object') return false;
+  const v = b as Record<string, unknown>;
+  return (
+    typeof v.version === 'number' &&
+    typeof v.identity_hex === 'string' && /^[0-9a-fA-F]{128}$/.test(v.identity_hex) &&
+    typeof v.address_hex === 'string' && /^[0-9a-fA-F]{32}$/.test(v.address_hex) &&
+    typeof v.created_at === 'string'
+  );
+}
+
+function tryJson<T>(raw: string | null, fallback: T): T {
+  if (!raw) return fallback;
+  try { return JSON.parse(raw) as T; } catch { return fallback; }
+}
+
+// ── Provider ──────────────────────────────────────────────────────────────────
+
+export function LxmfProvider({ children }: { children: React.ReactNode }) {
+  const [identity, setIdentity] = useState<StoredIdentity | null>(null);
+  const [identityHydrated, setIdentityHydrated] = useState(false);
+  const [displayName, setDisplayNameState] = useState('lxmf-mobile');
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const contactMapRef = useRef<Record<string, Contact>>({});
+  const lastEventRef = useRef<LxmfEvent | null>(null);
+
+  // Hydrate from SecureStore on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await SecureStore.getItemAsync(IDENTITY_KEY);
+        const parsed = tryJson<unknown>(raw, null);
+        if (isValidIdentity(parsed)) setIdentity(parsed);
+      } catch {}
+      try {
+        const raw = await SecureStore.getItemAsync(CONTACTS_KEY);
+        const map = tryJson<Record<string, Contact>>(raw, {});
+        contactMapRef.current = map;
+        setContacts(sortedContacts(map));
+      } catch {}
+      try {
+        const name = await SecureStore.getItemAsync(DISPLAY_NAME_KEY);
+        if (name) setDisplayNameState(name);
+      } catch {}
+      setIdentityHydrated(true);
+    })();
+  }, []);
+
+  const lxmf = useLxmf({
+    identityHex: identity?.identity_hex ?? 'new',
+    lxmfAddressHex: identity?.address_hex ?? 'new',
+    logLevel: 3,
+  });
+
+  // Persist identity whenever the node reports a new one
+  const identityHexRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!lxmf.isRunning) return;
+    const idHex = lxmf.getIdentityHex();
+    const addrHex = lxmf.status?.addressHex;
+    if (!idHex || idHex.length !== 128) return;
+    if (!addrHex || !/^[0-9a-fA-F]{32}$/.test(addrHex)) return;
+    if (identityHexRef.current === idHex) return;
+    identityHexRef.current = idHex;
+    const blob: StoredIdentity = {
+      version: 1,
+      identity_hex: idHex,
+      address_hex: addrHex,
+      created_at: identity?.created_at ?? new Date().toISOString(),
+    };
+    SecureStore.setItemAsync(IDENTITY_KEY, JSON.stringify(blob))
+      .then(() => setIdentity(blob))
+      .catch(() => {});
+  }, [lxmf.isRunning, lxmf.status?.addressHex]);
+
+  const persistContacts = useCallback((map: Record<string, Contact>) => {
+    setContacts(sortedContacts(map));
+    SecureStore.setItemAsync(CONTACTS_KEY, JSON.stringify(map)).catch(() => {});
+  }, []);
+
+  const upsertContact = useCallback((address: string, opts?: { name?: string; lastMessage?: string }) => {
+    const map = { ...contactMapRef.current };
+    const prev = map[address];
+    map[address] = {
+      address,
+      name: opts?.name ?? prev?.name ?? '',
+      lastSeen: Math.floor(Date.now() / 1000),
+      lastMessage: opts?.lastMessage ?? prev?.lastMessage ?? '',
+      unread: (prev?.unread ?? 0) + (opts?.lastMessage !== undefined ? 1 : 0),
+    };
+    contactMapRef.current = map;
+    persistContacts(map);
+  }, [persistContacts]);
+
+  const markRead = useCallback((address: string) => {
+    const map = { ...contactMapRef.current };
+    if (map[address]) {
+      map[address] = { ...map[address], unread: 0 };
+      contactMapRef.current = map;
+      persistContacts(map);
+    }
+  }, [persistContacts]);
+
+  // Process incoming events for contact list updates
+  useEffect(() => {
+    const latest = lxmf.events[0];
+    if (!latest || latest === lastEventRef.current) return;
+    lastEventRef.current = latest;
+
+    if (latest.type === 'announceReceived') {
+      const addr = String(latest.destHash ?? latest.address ?? '');
+      if (!addr || addr.length !== 32) return;
+      const name = latest.appData ? String(latest.appData) : undefined;
+      upsertContact(addr, { name });
+    }
+
+    if (latest.type === 'messageReceived') {
+      const addr = String(latest.source ?? '');
+      if (!addr || addr.length !== 32) return;
+      const body = latest.body ? b64preview(String(latest.body)) : '';
+      upsertContact(addr, { lastMessage: body });
+    }
+  }, [lxmf.events, upsertContact]);
+
+  const setDisplayName = useCallback((name: string) => {
+    setDisplayNameState(name);
+    SecureStore.setItemAsync(DISPLAY_NAME_KEY, name).catch(() => {});
+  }, []);
+
+  const clearIdentity = useCallback(async () => {
+    await SecureStore.deleteItemAsync(IDENTITY_KEY).catch(() => {});
+    identityHexRef.current = null;
+    setIdentity(null);
+  }, []);
+
+  const fetchMessages = useCallback((limit = 50): StoredMessage[] => {
+    try {
+      const raw: any[] = lxmf.fetchMessages(limit);
+      return raw as StoredMessage[];
+    } catch {
+      return [];
+    }
+  }, [lxmf.fetchMessages]);
+
+  return (
+    <LxmfContext.Provider value={{
+      isNativeAvailable: lxmf.isNativeAvailable,
+      isRunning: lxmf.isRunning,
+      status: lxmf.status,
+      error: lxmf.error,
+      events: lxmf.events,
+      start: lxmf.start,
+      stop: lxmf.stop,
+      send: lxmf.send,
+      broadcast: lxmf.broadcast,
+      fetchMessages,
+      getStatus: lxmf.getStatus,
+      getIdentityHex: lxmf.getIdentityHex,
+      bleUnpairedRNodeCount: lxmf.bleUnpairedRNodeCount,
+      setLogLevel: lxmf.setLogLevel,
+      identity,
+      identityHydrated,
+      clearIdentity,
+      displayName,
+      setDisplayName,
+      contacts,
+      upsertContact,
+      markRead,
+    }}>
+      {children}
+    </LxmfContext.Provider>
+  );
+}
+
+function sortedContacts(map: Record<string, Contact>): Contact[] {
+  return Object.values(map).sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+function b64preview(b64: string, maxLen = 60): string {
+  try {
+    const bin = globalThis.atob(b64);
+    const bytes = Uint8Array.from(bin, c => c.codePointAt(0) ?? 0);
+    const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+    return text.length > maxLen ? text.slice(0, maxLen) + '…' : text;
+  } catch {
+    return '';
+  }
+}
