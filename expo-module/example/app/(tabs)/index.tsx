@@ -207,6 +207,7 @@ export default function HomeScreen() {
 
   const [unpairedRNodes, setUnpairedRNodes] = useState(0);
   const [liveBleCount, setLiveBleCount] = useState(0);
+  const [storedMsgs, setStoredMsgs] = useState<any[]>([]);
 
   // Identity hydration: read once from secure store on mount. Until hydrated,
   // we pass 'new' so Rust generates a fresh identity (which we'll then persist
@@ -218,20 +219,13 @@ export default function HomeScreen() {
     (async () => {
       try {
         const raw = await SecureStore.getItemAsync(IDENTITY_KEY);
-        // TODO(sentinel): remove debug logs before merge — lengths/booleans only, no key material
-        console.log('[persist] hydrate', { hasRaw: !!raw, rawLen: raw?.length ?? 0 });
         if (cancelled) return;
         if (raw) {
           const parsed = JSON.parse(raw);
-          const valid = isValidIdentity(parsed);
-          console.log('[persist] parsed', { valid, hasIdHex: typeof parsed?.identity_hex === 'string', hasAddrHex: typeof parsed?.address_hex === 'string' });
-          if (valid) {
-            setStoredIdentity(parsed);
-          }
+          if (isValidIdentity(parsed)) setStoredIdentity(parsed);
         }
-      } catch (e: any) {
-        console.log('[persist] hydrate FAIL', e?.message ?? 'unknown');
-        // Corrupt blob or storage error — fall through; we'll generate fresh.
+      } catch {
+        // Corrupt blob or storage error — fall through; generate fresh identity.
       } finally {
         if (!cancelled) setIdentityHydrated(true);
       }
@@ -240,31 +234,23 @@ export default function HomeScreen() {
   }, []);
 
   const {
-    isNativeAvailable, isRunning, status, error, events, beacons,
-    start, stop, send, getStatus, getIdentityHex,
-    startBLE, stopBLE, bleUnpairedRNodeCount,
+    isNativeAvailable, isRunning, status, error, events,
+    start, stop, send, broadcast, getStatus, getIdentityHex, fetchMessages,
+    bleUnpairedRNodeCount,
   } = useLxmf({
     identityHex: storedIdentity?.identity_hex ?? 'new',
     lxmfAddressHex: storedIdentity?.address_hex ?? 'new',
     logLevel: 3,
   });
 
-  // Persist identity after node starts successfully (only if not already stored,
-  // or if the running identity differs — defensive against schema migrations).
+  // Persist identity after node starts (only when identity changes from stored copy).
   useEffect(() => {
     if (!isRunning) return;
     const idHex = getIdentityHex();
     const addrHex = status?.addressHex;
-    // TODO(sentinel): remove debug logs before merge — lengths/booleans only, no key material
-    console.log('[persist] save check', {
-      idHexLen: idHex?.length ?? 0,
-      addrHexLen: addrHex?.length ?? 0,
-      alreadyStoredSame: storedIdentity?.identity_hex === idHex && storedIdentity?.address_hex === addrHex,
-    });
     if (!idHex || idHex.length !== 128) return;
     if (!addrHex || !/^[0-9a-fA-F]{32}$/.test(addrHex)) return;
     if (storedIdentity?.identity_hex === idHex && storedIdentity?.address_hex === addrHex) return;
-
     const blob: StoredIdentity = {
       version: IDENTITY_SCHEMA_VERSION,
       identity_hex: idHex,
@@ -272,15 +258,14 @@ export default function HomeScreen() {
       created_at: new Date().toISOString(),
     };
     SecureStore.setItemAsync(IDENTITY_KEY, JSON.stringify(blob))
-      .then(() => {
-        console.log('[persist] save OK');
-        setStoredIdentity(blob);
-      })
-      .catch((e: any) => {
-        console.log('[persist] save FAIL', e?.message ?? 'unknown');
-        /* persistence failure is non-fatal for the running session */
-      });
+      .then(() => setStoredIdentity(blob))
+      .catch(() => { /* non-fatal */ });
   }, [isRunning, status?.addressHex, storedIdentity, getIdentityHex]);
+
+  // Load persisted messages from SQLite whenever node starts.
+  useEffect(() => {
+    if (isRunning) setStoredMsgs(fetchMessages(50));
+  }, [isRunning, fetchMessages]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
 
@@ -326,21 +311,18 @@ export default function HomeScreen() {
       mode: LxmfNodeMode.ReticulumAndBle,
       tcpInterfaces: [{ host, port }],
       displayName: displayName.trim() || 'lxmf-mobile',
-      isBeacon,
     });
     if (ok) {
       setTcpActive(true);
-      startBLE();
       setBleActive(true);
     }
-  }, [tcpHost, tcpPort, displayName, isBeacon, start, startBLE]);
+  }, [tcpHost, tcpPort, displayName, start]);
 
   const onStopTcp = useCallback(async () => {
-    stopBLE();
     await stop();
     setTcpActive(false);
     setBleActive(false);
-  }, [stop, stopBLE]);
+  }, [stop]);
 
   const onStartBle = useCallback(async () => {
     setTransportMsg('');
@@ -353,43 +335,31 @@ export default function HomeScreen() {
           ]
         : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
       const results = await PermissionsAndroid.requestMultiple(perms);
-      const denied = Object.values(results).some(r => r !== PermissionsAndroid.RESULTS.GRANTED);
-      if (denied) {
+      if (Object.values(results).some(r => r !== PermissionsAndroid.RESULTS.GRANTED)) {
         setTransportMsg('BLE permissions denied.');
         return;
       }
     }
-    // If node already running (started via TCP), just enable BLE hardware.
-    // Otherwise start mode 4 (TCP+BLE) using the configured TCP host/port.
-    if (!isRunning) {
-      const host = tcpHost.trim();
-      const port = Number(tcpPort);
-      if (!host) { setTransportMsg('Host required for TCP+BLE mode.'); return; }
-      if (!Number.isInteger(port) || port < 1 || port > 65535) { setTransportMsg('Port 1–65535.'); return; }
-      const ok = await start({
-        mode: LxmfNodeMode.ReticulumAndBle,
-        tcpInterfaces: [{ host, port }],
-        displayName: displayName.trim() || 'lxmf-mobile',
-        isBeacon,
-      });
-      if (!ok) {
-        setTransportMsg('Failed to start node.');
-        return;
-      }
-      setTcpActive(true);
-    }
-    startBLE();
+    const ok = await start({
+      mode: LxmfNodeMode.BleOnly,
+      displayName: displayName.trim() || 'lxmf-mobile',
+    });
+    if (!ok) { setTransportMsg('Failed to start BLE node.'); return; }
     setBleActive(true);
-  }, [isRunning, tcpHost, tcpPort, isBeacon, start, startBLE, displayName]);
+  }, [start, displayName]);
 
   const onStopBle = useCallback(async () => {
-    stopBLE();
+    await stop();
     setBleActive(false);
     setUnpairedRNodes(0);
-    if (isRunning) {
-      await stop();
-    }
-  }, [stopBLE, stop, isRunning]);
+  }, [stop]);
+
+  const onBroadcast = useCallback(async () => {
+    if (!knownPeerHashes.length) { setSendResult('No known peers.'); return; }
+    const dests = knownPeerHashes.map(p => p.hash);
+    const r = await broadcast(dests, utf8ToBase64(msgText));
+    setSendResult(r >= 0 ? `Broadcast #${r} → ${dests.length} peers` : 'Broadcast failed.');
+  }, [knownPeerHashes, msgText, broadcast]);
 
   // Poll for unpaired RNodes while BLE is active
   useEffect(() => {
@@ -617,13 +587,51 @@ export default function HomeScreen() {
         />
         <View style={S.btnRow}>
           <Btn label="Send" onPress={onSend} disabled={!isRunning} />
+          <Btn label="Broadcast" onPress={onBroadcast} disabled={!isRunning || !knownPeerHashes.length} />
         </View>
         {sendResult ? <Text style={S.feedback}>{sendResult}</Text> : null}
       </Accordion>
 
       {/* ── Messages ─────────────────────────────────────────────────────── */}
-      <Accordion title="Messages" badge={counts.messages} defaultOpen>
-        {msgEvts.length === 0 ? (
+      <Accordion title="Messages" badge={counts.messages + storedMsgs.length} defaultOpen>
+        {/* Persisted (SQLite) */}
+        {storedMsgs.length > 0 && (
+          <>
+            <Text style={S.sectionLabel}>Persisted ({storedMsgs.length})</Text>
+            {storedMsgs.map((m: any, i: number) => {
+              const bodyText = base64ToUtf8(m.body ?? '');
+              const titleText = m.title ? base64ToUtf8(m.title) : '';
+              const sender = m.source ?? m.source_hash ?? '';
+              const t = m.timestamp ? new Date(m.timestamp > 10_000_000_000 ? m.timestamp : m.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+              return (
+                <View key={`stored-${i}-${sender}`} style={[S.itemCard, S.storedCard]}>
+                  <View style={S.announceHeader}>
+                    <View style={S.announceInfo}>
+                      <Text selectable style={S.itemTitle}>From: {shortHex(sender)}</Text>
+                      {titleText ? <Text selectable style={S.msgTitle}>{titleText}</Text> : null}
+                      {bodyText ? <Text selectable style={S.itemBody}>{bodyText}</Text> : null}
+                      {t ? <Text style={S.itemMeta}>{t}</Text> : null}
+                    </View>
+                    {sender ? (
+                      <View style={S.announceActions}>
+                        <Pressable style={S.copyBtn} onPress={() => copyToClipboard(sender)}>
+                          <Text style={S.copyBtnText}>⎘</Text>
+                        </Pressable>
+                        <Pressable style={S.sendToBtn} onPress={() => { setDest(sender); setSendResult(''); }}>
+                          <Text style={S.sendToBtnText}>↩ Reply</Text>
+                        </Pressable>
+                      </View>
+                    ) : null}
+                  </View>
+                </View>
+              );
+            })}
+          </>
+        )}
+
+        {/* Live (in-session) */}
+        {msgEvts.length > 0 && <Text style={S.sectionLabel}>Live session</Text>}
+        {msgEvts.length === 0 && storedMsgs.length === 0 ? (
           <Text style={S.muted}>No messages yet.</Text>
         ) : (
           msgEvts.map((e, i) => {
@@ -885,4 +893,6 @@ const S = StyleSheet.create({
   // Message card extras
   msgTitle: { color: C.text, fontSize: 13, fontWeight: '600', fontStyle: 'italic' },
   mediaBadge: { color: C.accentBright, fontSize: 11, fontFamily: 'monospace', marginTop: 2 },
+  sectionLabel: { color: C.textDim, fontSize: 11, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.8, marginTop: 4 },
+  storedCard: { borderColor: '#253d50', backgroundColor: '#0b1a25' },
 });
