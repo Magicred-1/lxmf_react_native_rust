@@ -122,7 +122,7 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeIsRunning(
 
 #[no_mangle]
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativePollEvents(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     let events = LxmfNode::drain_events();
@@ -142,7 +142,7 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativePollEvents(
 /// or null if no node is initialized.
 #[no_mangle]
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetIdentityHex(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     match LxmfNode::get_identity_hex() {
@@ -158,7 +158,7 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetIdentityHex(
 
 #[no_mangle]
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetStatus(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     match LxmfNode::get_status_json() {
@@ -172,7 +172,7 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetStatus(
 
 #[no_mangle]
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetBeacons(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     let guard = match LxmfNode::global().lock() {
@@ -192,7 +192,7 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeGetBeacons(
 
 #[no_mangle]
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeFetchMessages(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     limit: jint,
 ) -> jstring {
@@ -356,10 +356,11 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBeaconRpc(
         Some(n) => n,
         None => return -1,
     };
-    match node.beacon_mgr.lock() {
+    let rpc_id = match node.beacon_mgr.lock() {
         Ok(mut mgr) => mgr.queue_rpc(dest, &method_str, params) as jlong,
         Err(_) => -1,
-    }
+    };
+    rpc_id
 }
 
 // --- Config ---
@@ -431,7 +432,7 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBleReceive(
 /// Returns a byte array: `[6-byte peer MAC][payload...]`, or `null` when nothing is queued.
 #[no_mangle]
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBlePollTx(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     match ble_iface::next_ble_tx() {
@@ -505,7 +506,7 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeNusReceive(
 /// RNode's NUS TX characteristic. Returns null when the queue is empty.
 #[no_mangle]
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeNusPollTx(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jbyteArray {
     match crate::nus_iface::next_nus_tx() {
