@@ -1,6 +1,5 @@
 import { useCallback, useState } from 'react';
 import {
-  Alert,
   Modal,
   Pressable,
   ScrollView,
@@ -26,7 +25,7 @@ function Row({ label, value, onAction, actionLabel }: Readonly<{
         <Text style={S.rowLabel}>{label}</Text>
         <Text selectable style={S.rowValue}>{value}</Text>
       </View>
-      {onAction && actionLabel && (
+      {!!(onAction && actionLabel) && (
         <Pressable style={({ pressed }) => [S.actionBtn, pressed && { opacity: 0.7 }]} onPress={onAction}>
           <Text style={S.actionBtnText}>{actionLabel}</Text>
         </Pressable>

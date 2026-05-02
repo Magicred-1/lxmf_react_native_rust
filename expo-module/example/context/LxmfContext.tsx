@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import * as SecureStore from 'expo-secure-store';
+import { documentDirectory } from 'expo-file-system/legacy';
 import {
   useLxmf,
   LxmfModule,
@@ -7,8 +8,12 @@ import {
   type LxmfEvent,
   type LxmfMedia,
   type LxmfNodeStatus,
-  type LxmfMessageEvent,
 } from '@magicred-1/react-native-lxmf';
+
+// Strip file:// URI prefix so rusqlite gets a raw filesystem path.
+const DB_PATH = documentDirectory
+  ? documentDirectory.replace('file://', '') + 'lxmf.db'
+  : undefined;
 
 // ── Persistence keys ─────────────────────────────────────────────────────────
 
@@ -144,6 +149,7 @@ export function LxmfProvider({ children }: { children: React.ReactNode }) {
   const lxmf = useLxmf({
     identityHex: identity?.identity_hex ?? 'new',
     lxmfAddressHex: identity?.address_hex ?? 'new',
+    dbPath: DB_PATH,
     logLevel: 3,
   });
 

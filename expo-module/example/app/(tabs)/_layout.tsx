@@ -26,6 +26,8 @@ export default function TabLayout() {
         },
         tabBarLabelStyle: { fontSize: 11, fontWeight: '600' },
       }}>
+      {/* Hide the redirect shim from the tab bar */}
+      <Tabs.Screen name="index" options={{ href: null }} />
       <Tabs.Screen
         name="conversations"
         options={{ title: 'Messages', tabBarIcon: iconConversations }}
