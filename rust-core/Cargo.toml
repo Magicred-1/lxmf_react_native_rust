@@ -36,6 +36,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # Hex encoding
 hex = "0.4"
 
+# Ed25519 signature verification for inbound LXMF packets
+ed25519-dalek = "2.1"
+
 # Base64 encoding for JNI message payloads
 base64 = "0.22"
 

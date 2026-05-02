@@ -272,8 +272,13 @@ class BleManager(
             if (characteristic.uuid == RNS_RX_CHAR_UUID && value != null && value.isNotEmpty()) {
                 if (preparedWrite) {
                     // ATT Long Write fragment — buffer until onExecuteWrite.
-                    preparedWriteBuffer.getOrPut(device.address) { java.io.ByteArrayOutputStream() }
-                        .write(value)
+                    val buf = preparedWriteBuffer.getOrPut(device.address) { java.io.ByteArrayOutputStream() }
+                    if (buf.size() + value.size <= 65536) {
+                        buf.write(value)
+                    } else {
+                        Log.w(TAG, "ATT Long Write buffer cap (64 KiB) exceeded from ${device.address}, discarding fragment")
+                        preparedWriteBuffer.remove(device.address)
+                    }
                 } else {
                     Log.d(TAG, "GATT server RX ${value.size}B from ${device.address}")
                     module.nativeBleReceive(macToBytes(device.address), value)

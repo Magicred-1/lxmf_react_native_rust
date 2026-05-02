@@ -46,6 +46,8 @@ pub const NUS_RX_CHAR_UUID: &str = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 /// Maximum KISS-decoded Reticulum packet size we'll accept.
 const NUS_MAX_PACKET: usize = 500;
+/// Maximum number of frames buffered from Swift before the async task drains them.
+const NUS_RX_QUEUE_MAX: usize = 64;
 
 // ── Shared queues (Swift ↔ Rust) ────────────────────────────────────────────
 
@@ -65,7 +67,11 @@ fn nus_tx_queue() -> Arc<Mutex<VecDeque<Vec<u8>>>> {
 /// `data` is raw bytes from the BLE characteristic — may be a partial KISS frame.
 pub fn on_nus_rx(data: Vec<u8>) {
     if let Ok(mut q) = nus_rx_queue().lock() {
-        q.push_back(data);
+        if q.len() < NUS_RX_QUEUE_MAX {
+            q.push_back(data);
+        } else {
+            log::warn!("NusInterface: RX queue full ({}), dropping frame", NUS_RX_QUEUE_MAX);
+        }
     }
 }
 

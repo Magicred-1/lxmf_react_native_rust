@@ -234,7 +234,7 @@ impl LxmfNode {
         let id_hex = private_identity.to_hex_string();
         // addr_hex is set later from my_dest.desc.address_hash (LXMF delivery destination hash)
 
-        info!("LxmfNode: identity={}", &id_hex[..16]);
+        info!("LxmfNode: identity addr={}", hex::encode(private_identity.address_hash().as_slice()));
 
         // Store identity bytes for persistence
         let id_bytes = private_identity.to_private_key_bytes().to_vec();
@@ -433,6 +433,7 @@ impl LxmfNode {
         let events_data = Arc::clone(&events);
         let store_data = store_arc.clone();
         let transport_data = Arc::clone(&transport_arc);
+        let peer_ids_verify = Arc::clone(&peer_ids_arc);
         task_handles.push(rt.spawn(async move {
             loop {
                 match data_rx.recv().await {
@@ -441,6 +442,19 @@ impl LxmfNode {
                         src.copy_from_slice(received.destination.as_slice());
                         let data = received.data.as_slice().to_vec();
                         info!("LxmfNode: received {} bytes from {}", data.len(), hex::encode(&src));
+                        // Verify Ed25519 LXMF signature before processing.
+                        let sig_result = {
+                            let ids = peer_ids_verify.lock().unwrap_or_else(|p| p.into_inner());
+                            verify_lxmf_signature(&data, &ids)
+                        };
+                        if sig_result == Some(false) {
+                            warn!("LxmfNode: invalid LXMF signature from {}, dropping",
+                                hex::encode(&data.get(16..32).unwrap_or(&[])));
+                            continue;
+                        }
+                        if sig_result.is_none() {
+                            warn!("LxmfNode: unverifiable LXMF signature (peer not in identity cache)");
+                        }
                         // Request a path to the sender so the transport resolves their
                         // identity — enabling immediate replies without waiting for their
                         // next periodic announce.
@@ -456,7 +470,11 @@ impl LxmfNode {
                         let event = lxmf_event_from_bytes(src, data);
                         persist_inbound_message(&store_data, &event);
                         if let Ok(mut eq) = events_data.lock() {
-                            eq.push_back(event);
+                            if eq.len() < 1024 {
+                                eq.push_back(event);
+                            } else {
+                                warn!("LxmfNode: event queue full, dropping inbound message");
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -634,7 +652,7 @@ impl LxmfNode {
         };
 
         let id_hex = private_identity.to_hex_string();
-        info!("LxmfNode full: identity={}", &id_hex[..16]);
+        info!("LxmfNode full: identity addr={}", hex::encode(private_identity.address_hash().as_slice()));
         let id_bytes = private_identity.to_private_key_bytes().to_vec();
 
         let events = {
@@ -809,6 +827,7 @@ impl LxmfNode {
         let events_data = Arc::clone(&events);
         let store_data = store_arc.clone();
         let transport_data = Arc::clone(&transport_arc);
+        let peer_ids_verify = Arc::clone(&peer_ids_arc);
         task_handles.push(rt.spawn(async move {
             loop {
                 match data_rx.recv().await {
@@ -817,6 +836,18 @@ impl LxmfNode {
                         src.copy_from_slice(received.destination.as_slice());
                         let data = received.data.as_slice().to_vec();
                         info!("LxmfNode full: received {} bytes from {}", data.len(), hex::encode(&src));
+                        let sig_result = {
+                            let ids = peer_ids_verify.lock().unwrap_or_else(|p| p.into_inner());
+                            verify_lxmf_signature(&data, &ids)
+                        };
+                        if sig_result == Some(false) {
+                            warn!("LxmfNode full: invalid LXMF signature from {}, dropping",
+                                hex::encode(&data.get(16..32).unwrap_or(&[])));
+                            continue;
+                        }
+                        if sig_result.is_none() {
+                            warn!("LxmfNode full: unverifiable LXMF signature (peer not in identity cache)");
+                        }
                         if data.len() >= 32 {
                             let mut sender = [0u8; 16];
                             sender.copy_from_slice(&data[16..32]);
@@ -829,7 +860,11 @@ impl LxmfNode {
                         let event = lxmf_event_from_bytes(src, data);
                         persist_inbound_message(&store_data, &event);
                         if let Ok(mut eq) = events_data.lock() {
-                            eq.push_back(event);
+                            if eq.len() < 1024 {
+                                eq.push_back(event);
+                            } else {
+                                warn!("LxmfNode full: event queue full, dropping inbound message");
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1090,7 +1125,11 @@ impl LxmfNode {
                     s.enqueue_outbound(seq, &dest_arr, &lxmf_payload).ok()
                 });
                 if let Ok(mut q) = pending_sends.lock() {
-                    q.push(PendingSend { seq, dest: dest_arr, lxmf_payload, store_id });
+                    if q.len() < 1000 {
+                        q.push(PendingSend { seq, dest: dest_arr, lxmf_payload, store_id });
+                    } else {
+                        warn!("LxmfNode::send_to: pending_sends cap (1000) reached, dropping seq={}", seq);
+                    }
                 }
                 if let Ok(mut eq) = events.lock() {
                     eq.push_back(LxmfEvent::MessageQueued { seq, dest_hex: dest_hex.to_string() });
@@ -1116,7 +1155,11 @@ impl LxmfNode {
                     s.enqueue_outbound(seq, &dest_arr, &lxmf_payload).ok()
                 });
                 if let Ok(mut q) = pending_sends.lock() {
-                    q.push(PendingSend { seq, dest: dest_arr, lxmf_payload, store_id });
+                    if q.len() < 1000 {
+                        q.push(PendingSend { seq, dest: dest_arr, lxmf_payload, store_id });
+                    } else {
+                        warn!("LxmfNode::send_to: pending_sends cap (1000) reached, dropping seq={}", seq);
+                    }
                 }
                 if let Ok(mut eq) = events.lock() {
                     eq.push_back(LxmfEvent::MessageQueued { seq, dest_hex: dest_hex.to_string() });
@@ -1385,6 +1428,7 @@ impl LxmfNode {
         let events_data = Arc::clone(&events);
         let store_data = store_arc.clone();
         let transport_data = Arc::clone(&transport_arc);
+        let peer_ids_verify = Arc::clone(&peer_ids_arc);
         task_handles.push(rt.spawn(async move {
             loop {
                 match data_rx.recv().await {
@@ -1397,17 +1441,33 @@ impl LxmfNode {
                         // Emit a synthetic announce for the sender so the UI peer list
                         // updates immediately instead of waiting up to 60s for their next
                         // periodic announce. Sender LXMF address = LXMF payload bytes 16-31.
-                        // Also request a path to the sender so the transport resolves their
-                        // identity, enabling immediate replies.
+                        // Also verify the LXMF signature and request a path so the transport
+                        // resolves the sender's identity for immediate replies.
                         if data.len() >= 32 {
                             let mut sender_hash = [0u8; 16];
                             sender_hash.copy_from_slice(&data[16..32]);
+
+                            let sig_result = {
+                                let ids = peer_ids_verify.lock().unwrap_or_else(|p| p.into_inner());
+                                verify_lxmf_signature(&data, &ids)
+                            };
+                            if sig_result == Some(false) {
+                                warn!("LxmfNode BLE: invalid LXMF signature from {}, dropping",
+                                    hex::encode(&sender_hash));
+                                continue;
+                            }
+                            if sig_result.is_none() {
+                                warn!("LxmfNode BLE: unverifiable LXMF signature (peer not in identity cache)");
+                            }
+
                             if let Ok(mut eq) = events_data.lock() {
-                                eq.push_back(LxmfEvent::AnnounceReceived {
-                                    dest_hash: sender_hash,
-                                    app_data: vec![],
-                                    hops: 0,
-                                });
+                                if eq.len() < 1024 {
+                                    eq.push_back(LxmfEvent::AnnounceReceived {
+                                        dest_hash: sender_hash,
+                                        app_data: vec![],
+                                        hops: 0,
+                                    });
+                                }
                             }
                             let t = Arc::clone(&transport_data);
                             tokio::spawn(async move {
@@ -1419,7 +1479,11 @@ impl LxmfNode {
                         let event = lxmf_event_from_bytes(src, data);
                         persist_inbound_message(&store_data, &event);
                         if let Ok(mut eq) = events_data.lock() {
-                            eq.push_back(event);
+                            if eq.len() < 1024 {
+                                eq.push_back(event);
+                            } else {
+                                warn!("LxmfNode BLE: event queue full, dropping inbound message");
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1660,6 +1724,32 @@ pub(crate) struct DecodedLxmf {
     pub(crate) files: Vec<(String, Vec<u8>)>,
 }
 
+/// Verify the Ed25519 signature on an inbound LXMF wire packet.
+///
+/// LXMF wire: [0..16] dest | [16..32] src | [32..96] sig | [96..] msgpack
+/// Signed region: data[0..32] + data[96..]  (dest + src + msgpack payload)
+///
+/// Returns:
+/// - `Some(true)`  — sender known, signature valid
+/// - `Some(false)` — sender known, signature INVALID → drop the packet
+/// - `None`        — sender not in peer_identities (no announce yet) → accept with warning
+pub(crate) fn verify_lxmf_signature(
+    data: &[u8],
+    peer_identities: &HashMap<[u8; 16], rns_transport::destination::DestinationDesc>,
+) -> Option<bool> {
+    if data.len() < 97 { return Some(false); }
+    let mut sender_hash = [0u8; 16];
+    sender_hash.copy_from_slice(&data[16..32]);
+    let desc = peer_identities.get(&sender_hash)?;
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(&data[32..96]) else {
+        return Some(false);
+    };
+    let mut signed = Vec::with_capacity(32 + data.len() - 96);
+    signed.extend_from_slice(&data[0..32]);
+    signed.extend_from_slice(&data[96..]);
+    Some(desc.identity.verify(&signed, &sig).is_ok())
+}
+
 /// Parse an LXMF wire payload.
 /// Format: [16B dest][16B src][64B sig][msgpack([f64 ts, bin title, bin body, map fields])]
 pub(crate) fn decode_lxmf_payload(data: &[u8]) -> Option<DecodedLxmf> {
@@ -1699,7 +1789,11 @@ pub(crate) fn mp_u16(data: &[u8], pos: &mut usize) -> Option<usize> {
 pub(crate) fn mp_u32(data: &[u8], pos: &mut usize) -> Option<usize> {
     let v = ((*data.get(*pos)? as usize) << 24) | ((*data.get(*pos+1)? as usize) << 16)
           | ((*data.get(*pos+2)? as usize) << 8) | (*data.get(*pos+3)? as usize);
-    *pos += 4; Some(v)
+    *pos += 4;
+    // Reject absurd blob lengths; `data.get()` would return None anyway, but this
+    // prevents corrupted skip arithmetic from confusing subsequent parsing.
+    if v > 16 * 1024 * 1024 { return None; }
+    Some(v)
 }
 
 pub(crate) fn mp_read_array_len(data: &[u8], pos: &mut usize) -> Option<usize> {
@@ -1713,20 +1807,26 @@ pub(crate) fn mp_read_array_len(data: &[u8], pos: &mut usize) -> Option<usize> {
 }
 
 pub(crate) fn mp_skip(data: &[u8], pos: &mut usize) {
+    mp_skip_inner(data, pos, 0);
+}
+
+fn mp_skip_inner(data: &[u8], pos: &mut usize, depth: usize) {
+    // Prevent stack overflow from maliciously deeply nested containers.
+    if depth > 16 { return; }
     let b = match data.get(*pos) { Some(&b) => { *pos += 1; b } None => return };
     match b {
         0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => {}
-        0xca | 0xce | 0xd2 => { *pos = pos.saturating_add(4); }
-        0xcb | 0xcf | 0xd3 => { *pos = pos.saturating_add(8); }
-        0xcc | 0xd0 => { *pos = pos.saturating_add(1); }
-        0xcd | 0xd1 => { *pos = pos.saturating_add(2); }
-        b if b & 0xe0 == 0xa0 => { *pos = pos.saturating_add((b & 0x1f) as usize); }
-        0xd9 | 0xc4 => { if let Some(&l) = data.get(*pos) { *pos += 1 + l as usize; } }
-        0xda | 0xc5 | 0xdc => { if let Some(n) = mp_u16(data, pos) { *pos += n; } }
-        0xdb | 0xc6 | 0xdd => { if let Some(n) = mp_u32(data, pos) { *pos += n; } }
-        b if b & 0xf0 == 0x90 => { let n = (b & 0x0f) as usize; for _ in 0..n { mp_skip(data, pos); } }
-        b if b & 0xf0 == 0x80 => { let n = (b & 0x0f) as usize; for _ in 0..n { mp_skip(data, pos); mp_skip(data, pos); } }
-        0xde => { if let Some(n) = mp_u16(data, pos) { for _ in 0..n { mp_skip(data, pos); mp_skip(data, pos); } } }
+        0xca | 0xce | 0xd2 => { *pos = (*pos + 4).min(data.len()); }
+        0xcb | 0xcf | 0xd3 => { *pos = (*pos + 8).min(data.len()); }
+        0xcc | 0xd0 => { *pos = (*pos + 1).min(data.len()); }
+        0xcd | 0xd1 => { *pos = (*pos + 2).min(data.len()); }
+        b if b & 0xe0 == 0xa0 => { *pos = (*pos + (b & 0x1f) as usize).min(data.len()); }
+        0xd9 | 0xc4 => { if let Some(&l) = data.get(*pos) { *pos = (*pos + 1 + l as usize).min(data.len()); } }
+        0xda | 0xc5 | 0xdc => { if let Some(n) = mp_u16(data, pos) { *pos = (*pos + n).min(data.len()); } }
+        0xdb | 0xc6 | 0xdd => { if let Some(n) = mp_u32(data, pos) { *pos = (*pos + n).min(data.len()); } }
+        b if b & 0xf0 == 0x90 => { let n = (b & 0x0f) as usize; for _ in 0..n { mp_skip_inner(data, pos, depth + 1); } }
+        b if b & 0xf0 == 0x80 => { let n = (b & 0x0f) as usize; for _ in 0..n { mp_skip_inner(data, pos, depth + 1); mp_skip_inner(data, pos, depth + 1); } }
+        0xde => { if let Some(n) = mp_u16(data, pos) { for _ in 0..n { mp_skip_inner(data, pos, depth + 1); mp_skip_inner(data, pos, depth + 1); } } }
         _ => {}
     }
 }
