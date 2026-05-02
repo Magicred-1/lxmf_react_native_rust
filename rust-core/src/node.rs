@@ -432,6 +432,7 @@ impl LxmfNode {
         // comment above). Mirrors the BLE-mode receiver shape.
         let events_data = Arc::clone(&events);
         let store_data = store_arc.clone();
+        let transport_data = Arc::clone(&transport_arc);
         task_handles.push(rt.spawn(async move {
             loop {
                 match data_rx.recv().await {
@@ -440,6 +441,18 @@ impl LxmfNode {
                         src.copy_from_slice(received.destination.as_slice());
                         let data = received.data.as_slice().to_vec();
                         info!("LxmfNode: received {} bytes from {}", data.len(), hex::encode(&src));
+                        // Request a path to the sender so the transport resolves their
+                        // identity — enabling immediate replies without waiting for their
+                        // next periodic announce.
+                        if data.len() >= 32 {
+                            let mut sender = [0u8; 16];
+                            sender.copy_from_slice(&data[16..32]);
+                            let t = Arc::clone(&transport_data);
+                            tokio::spawn(async move {
+                                use rns_transport::hash::AddressHash;
+                                t.lock().await.request_path(&AddressHash::new(sender), None, None).await;
+                            });
+                        }
                         let event = lxmf_event_from_bytes(src, data);
                         persist_inbound_message(&store_data, &event);
                         if let Ok(mut eq) = events_data.lock() {
@@ -795,6 +808,7 @@ impl LxmfNode {
         // Data receiver
         let events_data = Arc::clone(&events);
         let store_data = store_arc.clone();
+        let transport_data = Arc::clone(&transport_arc);
         task_handles.push(rt.spawn(async move {
             loop {
                 match data_rx.recv().await {
@@ -803,6 +817,15 @@ impl LxmfNode {
                         src.copy_from_slice(received.destination.as_slice());
                         let data = received.data.as_slice().to_vec();
                         info!("LxmfNode full: received {} bytes from {}", data.len(), hex::encode(&src));
+                        if data.len() >= 32 {
+                            let mut sender = [0u8; 16];
+                            sender.copy_from_slice(&data[16..32]);
+                            let t = Arc::clone(&transport_data);
+                            tokio::spawn(async move {
+                                use rns_transport::hash::AddressHash;
+                                t.lock().await.request_path(&AddressHash::new(sender), None, None).await;
+                            });
+                        }
                         let event = lxmf_event_from_bytes(src, data);
                         persist_inbound_message(&store_data, &event);
                         if let Ok(mut eq) = events_data.lock() {
@@ -1361,6 +1384,7 @@ impl LxmfNode {
         // Spawn data receiver.
         let events_data = Arc::clone(&events);
         let store_data = store_arc.clone();
+        let transport_data = Arc::clone(&transport_arc);
         task_handles.push(rt.spawn(async move {
             loop {
                 match data_rx.recv().await {
@@ -1373,6 +1397,8 @@ impl LxmfNode {
                         // Emit a synthetic announce for the sender so the UI peer list
                         // updates immediately instead of waiting up to 60s for their next
                         // periodic announce. Sender LXMF address = LXMF payload bytes 16-31.
+                        // Also request a path to the sender so the transport resolves their
+                        // identity, enabling immediate replies.
                         if data.len() >= 32 {
                             let mut sender_hash = [0u8; 16];
                             sender_hash.copy_from_slice(&data[16..32]);
@@ -1383,6 +1409,11 @@ impl LxmfNode {
                                     hops: 0,
                                 });
                             }
+                            let t = Arc::clone(&transport_data);
+                            tokio::spawn(async move {
+                                use rns_transport::hash::AddressHash;
+                                t.lock().await.request_path(&AddressHash::new(sender_hash), None, None).await;
+                            });
                         }
 
                         let event = lxmf_event_from_bytes(src, data);
