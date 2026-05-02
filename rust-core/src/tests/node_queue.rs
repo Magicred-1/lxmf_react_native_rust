@@ -12,11 +12,10 @@
 /// Node tests share the global LxmfNode singleton so they must be serialised.
 
 use crate::node::{LxmfNode, LxmfEvent};
-use std::sync::Mutex;
 
-/// Serialize all node lifecycle tests; parallel tests racing on the global NODE
-/// singleton would corrupt each other's state.
-static NODE_LOCK: Mutex<()> = Mutex::new(());
+// Use the shared lock from tests::mod — all node tests must hold the same mutex
+// so concurrent test threads don't race on the global LxmfNode singleton.
+use super::NODE_LOCK;
 
 /// Unknown 32-hex-char destination that has no identity in the transport table.
 fn unknown_dest_hex() -> String {

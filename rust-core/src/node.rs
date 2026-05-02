@@ -1238,28 +1238,115 @@ impl LxmfNode {
             eq.push_back(LxmfEvent::StatusChanged { running: true, lifecycle: 0 });
         }
 
+        // Extract pending-send queue and identity cache — mirrors start_reticulum.
+        // Required so the announce receiver can flush queued outbound messages
+        // when a BLE peer announces after a DroppedMissingDestinationIdentity send.
+        let (pending_for_ann, peer_ids_arc) = {
+            let guard = Self::global().lock().map_err(|e| e.to_string())?;
+            let node = guard.as_ref().ok_or("Node not initialized")?;
+            (Arc::clone(&node.pending_sends), Arc::clone(&node.peer_identities))
+        };
+        let transport_for_ann = Arc::clone(&transport_arc);
+        // Reload persistent outbound queue from SQLite so messages queued in a
+        // previous stop/start cycle are retried once the peer re-announces.
+        if let Some(s) = &store_arc {
+            if let Ok(rows) = s.all_outbound_queue() {
+                let mut q = pending_for_ann.lock().unwrap_or_else(|p| p.into_inner());
+                let existing: std::collections::HashSet<u64> = q.iter().map(|p| p.seq).collect();
+                for (id, seq, dest, payload) in rows {
+                    if !existing.contains(&seq) {
+                        q.push(PendingSend { seq, dest, lxmf_payload: payload, store_id: Some(id) });
+                    }
+                }
+            }
+        }
+
         // Collect JoinHandles so stop() can abort every spawned task and
         // prevent zombie task accumulation across Stop/Start cycles.
         let mut task_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         // Spawn announce receiver.
         let events_ann = Arc::clone(&events);
+        let store_ann = store_arc.clone();
+        let pending_for_ann_task = Arc::clone(&pending_for_ann);
+        let peer_ids_ann = Arc::clone(&peer_ids_arc);
+        let transport_ann = Arc::clone(&transport_for_ann);
         let mut announce_rx = announce_rx;
         task_handles.push(rt.spawn(async move {
             loop {
                 match announce_rx.recv().await {
                     Ok(event) => {
-                        let dest = event.destination.lock().await;
-                        let hash_bytes = dest.desc.address_hash;
-                        let mut dh = [0u8; 16];
-                        dh.copy_from_slice(hash_bytes.as_slice());
-                        let app_data = event.app_data.as_slice().to_vec();
-                        info!("LxmfNode BLE: announce from {} ({} hops)", hex::encode(&dh), event.hops);
+                        let (dh, desc, app_data, hops) = {
+                            let dest = event.destination.lock().await;
+                            let desc = dest.desc;
+                            let hash_bytes = desc.address_hash;
+                            let mut dh = [0u8; 16];
+                            dh.copy_from_slice(hash_bytes.as_slice());
+                            let app_data = event.app_data.as_slice().to_vec();
+                            let hops = event.hops;
+                            (dh, desc, app_data, hops)
+                        };
+                        info!("LxmfNode BLE: announce from {} ({} hops)", hex::encode(&dh), hops);
+
+                        // Cache identity for large-payload link sends (DroppedCiphertextTooLarge path).
+                        if let Ok(mut ids) = peer_ids_ann.lock() {
+                            ids.insert(dh, desc);
+                        }
+
+                        // Flush any outbound messages queued while peer identity was unknown.
+                        // Mirrors the TCP-mode announce receiver so BLE replies aren't held
+                        // indefinitely after a DroppedMissingDestinationIdentity → path-request cycle.
+                        let to_retry: Vec<(u64, Option<i64>, Vec<u8>)> = {
+                            let mut q = pending_for_ann_task.lock().unwrap_or_else(|p| p.into_inner());
+                            let (matched, rest): (Vec<_>, Vec<_>) = q.drain(..).partition(|s| s.dest == dh);
+                            *q = rest;
+                            matched.into_iter().map(|s| (s.seq, s.store_id, s.lxmf_payload)).collect()
+                        };
+                        if !to_retry.is_empty() {
+                            use rns_transport::hash::AddressHash;
+                            use rns_transport::packet::{Packet, PacketDataBuffer};
+                            use rns_transport::transport::SendPacketOutcome;
+                            use rns_transport::delivery::send_via_link;
+                            let transport = transport_ann.lock().await;
+                            for (seq, store_id, payload) in &to_retry {
+                                let mut dest_arr = [0u8; 16];
+                                dest_arr.copy_from_slice(&payload[..16]);
+                                let packet = Packet {
+                                    destination: AddressHash::new(dest_arr),
+                                    data: PacketDataBuffer::new_from_slice(payload),
+                                    ..Default::default()
+                                };
+                                let outcome = transport.send_packet_with_outcome(packet).await;
+                                info!("LxmfNode BLE: opportunistic retry seq={} -> {:?}", seq, outcome);
+                                let delivered = match outcome {
+                                    SendPacketOutcome::SentDirect | SendPacketOutcome::SentBroadcast => true,
+                                    SendPacketOutcome::DroppedCiphertextTooLarge => {
+                                        match send_via_link(&transport, desc, payload, std::time::Duration::from_secs(15)).await {
+                                            Ok(_) => { info!("LxmfNode BLE: link-send seq={} ok", seq); true }
+                                            Err(e) => { warn!("LxmfNode BLE: link-send seq={} failed: {e}", seq); false }
+                                        }
+                                    }
+                                    _ => false,
+                                };
+                                if delivered {
+                                    if let Some(id) = store_id {
+                                        if let Some(s) = &store_ann { let _ = s.remove_outbound(*id); }
+                                    }
+                                    if let Ok(mut eq) = events_ann.lock() {
+                                        eq.push_back(LxmfEvent::MessageDelivered { seq: *seq, dest_hex: hex::encode(&dh) });
+                                    }
+                                } else {
+                                    let mut q = pending_for_ann_task.lock().unwrap_or_else(|p| p.into_inner());
+                                    q.push(PendingSend { seq: *seq, dest: dh, lxmf_payload: payload.clone(), store_id: *store_id });
+                                }
+                            }
+                        }
+
                         if let Ok(mut eq) = events_ann.lock() {
                             eq.push_back(LxmfEvent::AnnounceReceived {
                                 dest_hash: dh,
                                 app_data,
-                                hops: event.hops,
+                                hops,
                             });
                         }
                     }
@@ -1282,6 +1369,22 @@ impl LxmfNode {
                         src.copy_from_slice(received.destination.as_slice());
                         let data = received.data.as_slice().to_vec();
                         info!("LxmfNode BLE: received {} bytes", data.len());
+
+                        // Emit a synthetic announce for the sender so the UI peer list
+                        // updates immediately instead of waiting up to 60s for their next
+                        // periodic announce. Sender LXMF address = LXMF payload bytes 16-31.
+                        if data.len() >= 32 {
+                            let mut sender_hash = [0u8; 16];
+                            sender_hash.copy_from_slice(&data[16..32]);
+                            if let Ok(mut eq) = events_data.lock() {
+                                eq.push_back(LxmfEvent::AnnounceReceived {
+                                    dest_hash: sender_hash,
+                                    app_data: vec![],
+                                    hops: 0,
+                                });
+                            }
+                        }
+
                         let event = lxmf_event_from_bytes(src, data);
                         persist_inbound_message(&store_data, &event);
                         if let Ok(mut eq) = events_data.lock() {
