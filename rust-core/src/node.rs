@@ -447,13 +447,20 @@ impl LxmfNode {
                             let ids = peer_ids_verify.lock().unwrap_or_else(|p| p.into_inner());
                             verify_lxmf_signature(&data, &ids)
                         };
-                        if sig_result == Some(false) {
-                            warn!("LxmfNode: invalid LXMF signature from {}, dropping",
-                                hex::encode(&data.get(16..32).unwrap_or(&[])));
-                            continue;
-                        }
-                        if sig_result.is_none() {
-                            warn!("LxmfNode: unverifiable LXMF signature (peer not in identity cache)");
+                        match sig_result {
+                            Some(true) => {}
+                            Some(false) => {
+                                warn!("LxmfNode: invalid LXMF signature from {}, dropping",
+                                    hex::encode(&data.get(16..32).unwrap_or(&[])));
+                                continue;
+                            }
+                            None => {
+                                // Peer not yet announced — drop the message; the request_path
+                                // below will trigger a re-announce so the next message passes.
+                                warn!("LxmfNode: dropping message from unannounced peer {} (no identity cached)",
+                                    hex::encode(&data.get(16..32).unwrap_or(&[])));
+                                continue;
+                            }
                         }
                         // Request a path to the sender so the transport resolves their
                         // identity — enabling immediate replies without waiting for their
@@ -840,13 +847,18 @@ impl LxmfNode {
                             let ids = peer_ids_verify.lock().unwrap_or_else(|p| p.into_inner());
                             verify_lxmf_signature(&data, &ids)
                         };
-                        if sig_result == Some(false) {
-                            warn!("LxmfNode full: invalid LXMF signature from {}, dropping",
-                                hex::encode(&data.get(16..32).unwrap_or(&[])));
-                            continue;
-                        }
-                        if sig_result.is_none() {
-                            warn!("LxmfNode full: unverifiable LXMF signature (peer not in identity cache)");
+                        match sig_result {
+                            Some(true) => {}
+                            Some(false) => {
+                                warn!("LxmfNode full: invalid LXMF signature from {}, dropping",
+                                    hex::encode(&data.get(16..32).unwrap_or(&[])));
+                                continue;
+                            }
+                            None => {
+                                warn!("LxmfNode full: dropping message from unannounced peer {} (no identity cached)",
+                                    hex::encode(&data.get(16..32).unwrap_or(&[])));
+                                continue;
+                            }
                         }
                         if data.len() >= 32 {
                             let mut sender = [0u8; 16];
@@ -1447,17 +1459,33 @@ impl LxmfNode {
                             let mut sender_hash = [0u8; 16];
                             sender_hash.copy_from_slice(&data[16..32]);
 
+                            // Fire request_path unconditionally — even if we drop this
+                            // message (unknown peer), the path request prompts the peer
+                            // to re-announce so their identity enters peer_identities and
+                            // the next message passes signature verification.
+                            let t = Arc::clone(&transport_data);
+                            tokio::spawn(async move {
+                                use rns_transport::hash::AddressHash;
+                                t.lock().await.request_path(&AddressHash::new(sender_hash), None, None).await;
+                            });
+
                             let sig_result = {
                                 let ids = peer_ids_verify.lock().unwrap_or_else(|p| p.into_inner());
                                 verify_lxmf_signature(&data, &ids)
                             };
-                            if sig_result == Some(false) {
-                                warn!("LxmfNode BLE: invalid LXMF signature from {}, dropping",
-                                    hex::encode(&sender_hash));
-                                continue;
-                            }
-                            if sig_result.is_none() {
-                                warn!("LxmfNode BLE: unverifiable LXMF signature (peer not in identity cache)");
+                            match sig_result {
+                                Some(true) => {}
+                                Some(false) => {
+                                    warn!("LxmfNode BLE: invalid LXMF signature from {}, dropping",
+                                        hex::encode(&sender_hash));
+                                    continue;
+                                }
+                                None => {
+                                    // Drop message; request_path already fired above.
+                                    warn!("LxmfNode BLE: dropping message from unannounced peer {} (no identity cached)",
+                                        hex::encode(&sender_hash));
+                                    continue;
+                                }
                             }
 
                             if let Ok(mut eq) = events_data.lock() {
@@ -1469,11 +1497,6 @@ impl LxmfNode {
                                     });
                                 }
                             }
-                            let t = Arc::clone(&transport_data);
-                            tokio::spawn(async move {
-                                use rns_transport::hash::AddressHash;
-                                t.lock().await.request_path(&AddressHash::new(sender_hash), None, None).await;
-                            });
                         }
 
                         let event = lxmf_event_from_bytes(src, data);
@@ -1823,7 +1846,14 @@ fn mp_skip_inner(data: &[u8], pos: &mut usize, depth: usize) {
         b if b & 0xe0 == 0xa0 => { *pos = (*pos + (b & 0x1f) as usize).min(data.len()); }
         0xd9 | 0xc4 => { if let Some(&l) = data.get(*pos) { *pos = (*pos + 1 + l as usize).min(data.len()); } }
         0xda | 0xc5 | 0xdc => { if let Some(n) = mp_u16(data, pos) { *pos = (*pos + n).min(data.len()); } }
-        0xdb | 0xc6 | 0xdd => { if let Some(n) = mp_u32(data, pos) { *pos = (*pos + n).min(data.len()); } }
+        0xdb | 0xc6 | 0xdd => {
+            match mp_u32(data, pos) {
+                Some(n) => { *pos = (*pos + n).min(data.len()); }
+                // mp_u32 returned None (> 16 MiB cap or out of bounds).
+                // Advance to end so no subsequent bytes are misread as keys.
+                None => { *pos = data.len(); }
+            }
+        }
         b if b & 0xf0 == 0x90 => { let n = (b & 0x0f) as usize; for _ in 0..n { mp_skip_inner(data, pos, depth + 1); } }
         b if b & 0xf0 == 0x80 => { let n = (b & 0x0f) as usize; for _ in 0..n { mp_skip_inner(data, pos, depth + 1); mp_skip_inner(data, pos, depth + 1); } }
         0xde => { if let Some(n) = mp_u16(data, pos) { for _ in 0..n { mp_skip_inner(data, pos, depth + 1); mp_skip_inner(data, pos, depth + 1); } } }

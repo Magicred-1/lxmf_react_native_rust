@@ -101,6 +101,27 @@ fn ble_peers() -> Arc<Mutex<Vec<[u8; 6]>>> {
     P.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone()
 }
 
+/// Per-peer rate-limit state: (window_start, frame_count_in_window).
+fn ble_rx_rate_state() -> Arc<Mutex<HashMap<[u8; 6], (std::time::Instant, usize)>>> {
+    static RL: OnceLock<Arc<Mutex<HashMap<[u8; 6], (std::time::Instant, usize)>>>> = OnceLock::new();
+    RL.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))).clone()
+}
+
+/// Returns true if the frame should be accepted; false if the peer has exceeded BLE_RX_PPS_LIMIT.
+fn check_ble_rx_rate(peer_addr: [u8; 6]) -> bool {
+    let state = ble_rx_rate_state();
+    let Ok(mut map) = state.lock() else { return true };
+    let now = std::time::Instant::now();
+    let entry = map.entry(peer_addr).or_insert((now, 0));
+    if now.duration_since(entry.0).as_secs() >= 1 {
+        *entry = (now, 1);
+        true
+    } else {
+        entry.1 += 1;
+        entry.1 <= BLE_RX_PPS_LIMIT
+    }
+}
+
 /// Notifier fired whenever a new BLE peer completes GATT connect.
 /// The node task awaits this to trigger an immediate re-announce, so
 /// peers don't have to wait for the 5s periodic timer after first connect.
@@ -120,9 +141,17 @@ pub fn peer_connected_notify() -> Arc<tokio::sync::Notify> {
 /// Maximum frames buffered from Kotlin before backpressure drops newest arrivals.
 /// Matches lxmf-sdk MobileBleCapabilities::max_notification_queue contract.
 const BLE_RX_QUEUE_MAX: usize = 64;
+/// Maximum BLE frames accepted per peer per second. Excess frames are dropped
+/// to prevent a single rogue device from flooding the transport pipeline.
+const BLE_RX_PPS_LIMIT: usize = 50;
 
 /// Kotlin calls this when a BLE characteristic notification arrives from a peer.
 pub fn on_ble_rx(peer_addr: [u8; 6], data: Vec<u8>) {
+    if !check_ble_rx_rate(peer_addr) {
+        log::warn!("BleInterface: rate limit ({} pps) exceeded from {:02x?}, dropping",
+            BLE_RX_PPS_LIMIT, peer_addr);
+        return;
+    }
     if let Ok(mut q) = ble_rx_queue().lock() {
         if q.len() >= BLE_RX_QUEUE_MAX {
             log::warn!("BleInterface: RX queue full ({} frames), dropping from {:02x?}", BLE_RX_QUEUE_MAX, peer_addr);
