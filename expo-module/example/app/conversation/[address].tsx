@@ -85,15 +85,17 @@ function Bubble({ msg }: Readonly<{ msg: BubbleMsg }>) {
 export default function ConversationScreen() {
   const { address } = useLocalSearchParams<{ address: string }>();
   const router = useRouter();
-  const { events, send, fetchMessages, markRead, contacts, upsertContact } = useLxmfContext();
+  const { events, send, fetchMessages, markRead, contacts, upsertContact, groups, isGroup, shareGroupInvite } = useLxmfContext();
 
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
   const [sendErr, setSendErr] = useState('');
   const listRef = useRef<FlatList>(null);
 
-  const contact = contacts.find(c => c.address === address);
-  const peerName = contact?.name || shortHex(address ?? '');
+  const isGroupThread = isGroup(address ?? '');
+  const group = isGroupThread ? groups.find(g => g.addrHex === address) : undefined;
+  const contact = !isGroupThread ? contacts.find(c => c.address === address) : undefined;
+  const peerName = group?.name ?? contact?.name ?? shortHex(address ?? '');
 
   // Mark thread as read on open
   useEffect(() => {
@@ -167,16 +169,21 @@ export default function ConversationScreen() {
     if (!trimmed || !address) return;
     setSending(true);
     setSendErr('');
-    const r = await send(address, b64encode(trimmed));
+    // send() in context auto-routes: group address → sendGroup, peer address → send
+    const r = await send(address, trimmed);
     setSending(false);
     if (r >= 0) {
       setText('');
-      upsertContact(address, { lastMessage: trimmed });
+      if (!isGroupThread) upsertContact(address, { lastMessage: trimmed });
       loadHistory();
     } else {
       setSendErr('Send failed — message queued for retry.');
     }
-  }, [text, address, send, upsertContact, loadHistory]);
+  }, [text, address, send, isGroupThread, upsertContact, loadHistory]);
+
+  const onShare = useCallback(() => {
+    if (address) shareGroupInvite(address);
+  }, [address, shareGroupInvite]);
 
   const renderBubble = useCallback(({ item }: { item: BubbleMsg }) => (
     <Bubble msg={item} />
@@ -196,9 +203,17 @@ export default function ConversationScreen() {
           <Text style={S.backBtnText}>‹</Text>
         </Pressable>
         <View style={S.headerCenter}>
-          <Text style={S.headerName} numberOfLines={1}>{peerName}</Text>
+          <View style={S.headerNameRow}>
+            {isGroupThread && <Text style={S.groupHash}>#</Text>}
+            <Text style={S.headerName} numberOfLines={1}>{peerName}</Text>
+          </View>
           <Text selectable style={S.headerAddr}>{shortHex(address ?? '')}</Text>
         </View>
+        {isGroupThread && (
+          <Pressable style={({ pressed }) => [S.shareBtn, pressed && { opacity: 0.7 }]} onPress={onShare}>
+            <Text style={S.shareBtnText}>Share</Text>
+          </Pressable>
+        )}
       </View>
 
       {/* Message list */}
@@ -218,7 +233,7 @@ export default function ConversationScreen() {
         <View style={S.compose}>
           <TextInput
             style={S.composeInput}
-            placeholder="Message…"
+            placeholder={isGroupThread ? `Message #${peerName}…` : 'Message…'}
             placeholderTextColor="#4a6070"
             value={text}
             onChangeText={setText}
@@ -226,7 +241,7 @@ export default function ConversationScreen() {
             maxLength={2000}
           />
           <Pressable
-            style={({ pressed }) => [S.sendBtn, (!text.trim() || sending) && S.sendBtnDisabled, pressed && { opacity: 0.75 }]}
+            style={({ pressed }) => [S.sendBtn, isGroupThread && S.sendBtnGroup, (!text.trim() || sending) && S.sendBtnDisabled, pressed && { opacity: 0.75 }]}
             onPress={onSend}
             disabled={!text.trim() || sending}>
             <Text style={S.sendBtnText}>{sending ? '…' : '↑'}</Text>
@@ -256,8 +271,19 @@ const S = StyleSheet.create({
   backBtn: { paddingHorizontal: 8, paddingVertical: 4 },
   backBtnText: { color: '#1a7fc1', fontSize: 30, lineHeight: 34 },
   headerCenter: { flex: 1 },
-  headerName: { color: '#d8ecf8', fontSize: 16, fontWeight: '700' },
+  headerNameRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  groupHash: { color: '#3edba8', fontSize: 18, fontWeight: '700', lineHeight: 22 },
+  headerName: { color: '#d8ecf8', fontSize: 16, fontWeight: '700', flex: 1 },
   headerAddr: { color: '#4a6070', fontSize: 11, fontFamily: 'monospace' },
+  shareBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: '#1a3328',
+    borderWidth: 1,
+    borderColor: '#3edba8',
+  },
+  shareBtnText: { color: '#3edba8', fontSize: 12, fontWeight: '600' },
 
   list: { paddingHorizontal: 12, paddingVertical: 12, gap: 6, flexGrow: 1 },
 
@@ -324,6 +350,7 @@ const S = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  sendBtnGroup: { backgroundColor: '#1a8c6a' },
   sendBtnDisabled: { opacity: 0.35 },
   sendBtnText: { color: '#fff', fontSize: 20, fontWeight: '700' },
 });

@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import * as SecureStore from 'expo-secure-store';
+import { Share } from 'react-native';
 import { documentDirectory } from 'expo-file-system/legacy';
 import {
   useLxmf,
@@ -15,6 +16,7 @@ const DB_PATH = documentDirectory
 const IDENTITY_KEY = 'lxmf.identity.v1';
 const CONTACTS_KEY = 'lxmf.contacts.v1';
 const DISPLAY_NAME_KEY = 'lxmf.displayName';
+const GROUPS_KEY = 'lxmf.groups.v1';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -46,6 +48,12 @@ export type StoredMessage = {
   files?: { name: string; data: string }[];
 };
 
+export type Group = {
+  addrHex: string;
+  name: string;
+  keyHex: string;
+};
+
 // ── Context ───────────────────────────────────────────────────────────────────
 
 export type LxmfContextValue = {
@@ -66,7 +74,7 @@ export type LxmfContextValue = {
   stop: () => Promise<void>;
   getStatus: () => LxmfNodeStatus | null;
   setLogLevel: (level: number) => void;
-  // Messaging
+  // Messaging — auto-routes DM vs group based on dest address
   send: (dest: string, body: string) => Promise<number>;
   fetchMessages: (limit?: number) => StoredMessage[];
   // Identity
@@ -80,6 +88,13 @@ export type LxmfContextValue = {
   contacts: Contact[];
   upsertContact: (address: string, opts?: { name?: string; lastMessage?: string }) => void;
   markRead: (address: string) => void;
+  // Groups
+  groups: Group[];
+  createGroup: (name: string) => string;
+  joinGroup: (addrHex: string, keyHex: string) => boolean;
+  leaveGroup: (addrHex: string) => void;
+  isGroup: (addrHex: string) => boolean;
+  shareGroupInvite: (addrHex: string) => Promise<void>;
 };
 
 const LxmfContext = createContext<LxmfContextValue | null>(null);
@@ -122,6 +137,12 @@ function sortedContacts(map: Record<string, Contact>): Contact[] {
   return Object.values(map).sort((a, b) => b.lastSeen - a.lastSeen);
 }
 
+function generateKeyHex(): string {
+  const buf = new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, b => b.toString(16).padStart(2, '0')).join('');
+}
+
 // ── Provider ──────────────────────────────────────────────────────────────────
 
 export function LxmfProvider({ children }: { readonly children: React.ReactNode }) {
@@ -129,9 +150,17 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
   const [identityHydrated, setIdentityHydrated] = useState(false);
   const [displayName, setDisplayNameState] = useState('lxmf-mobile');
   const [contacts, setContacts] = useState<Contact[]>([]);
+  const [groups, setGroups] = useState<Group[]>([]);
   const contactMapRef = useRef<Record<string, Contact>>({});
-  // Tracks the most recent processed event so the effect only processes new ones.
+  const groupMapRef = useRef<Record<string, Group>>({});
   const lastEventRef = useRef<LxmfEvent | null>(null);
+
+  const lxmf = useLxmf({
+    identityHex: identity?.identity_hex ?? 'new',
+    lxmfAddressHex: identity?.address_hex ?? 'new',
+    dbPath: DB_PATH,
+    logLevel: 3,
+  });
 
   // Load persisted state on mount
   useEffect(() => {
@@ -151,16 +180,22 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
         const name = await SecureStore.getItemAsync(DISPLAY_NAME_KEY);
         if (name) setDisplayNameState(name);
       } catch {}
+      try {
+        const raw = await SecureStore.getItemAsync(GROUPS_KEY);
+        const list = tryJson<Group[]>(raw, []);
+        const map: Record<string, Group> = {};
+        for (const g of list) map[g.addrHex] = g;
+        groupMapRef.current = map;
+        setGroups(list);
+        // Re-register with Rust — in-memory registry clears on process restart
+        for (const g of list) {
+          try { lxmf.joinGroup(g.addrHex, g.keyHex); } catch {}
+        }
+      } catch {}
       setIdentityHydrated(true);
     })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const lxmf = useLxmf({
-    identityHex: identity?.identity_hex ?? 'new',
-    lxmfAddressHex: identity?.address_hex ?? 'new',
-    dbPath: DB_PATH,
-    logLevel: 3,
-  });
 
   // Persist identity whenever the running node reports one
   const identityHexRef = useRef<string | null>(null);
@@ -188,6 +223,11 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
     SecureStore.setItemAsync(CONTACTS_KEY, JSON.stringify(map)).catch(() => {});
   }, []);
 
+  const persistGroups = useCallback((list: Group[]) => {
+    setGroups(list);
+    SecureStore.setItemAsync(GROUPS_KEY, JSON.stringify(list)).catch(() => {});
+  }, []);
+
   const upsertContact = useCallback((address: string, opts?: { name?: string; lastMessage?: string }) => {
     const map = { ...contactMapRef.current };
     const prev = map[address];
@@ -211,8 +251,7 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
     }
   }, [persistContacts]);
 
-  // Update contacts from incoming events. Iterates all events newer than the
-  // last-seen one so batch deliveries (multiple events per poll) aren't missed.
+  // Update contacts from incoming events
   useEffect(() => {
     for (const event of lxmf.events) {
       if (event === lastEventRef.current) break;
@@ -224,7 +263,7 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
         }
       } else if (event.type === 'messageReceived') {
         const addr = String(event.source ?? '');
-        if (addr.length === 32) {
+        if (addr.length === 32 && !groupMapRef.current[addr]) {
           upsertContact(addr, { lastMessage: event.body ? b64preview(String(event.body)) : '' });
         }
       }
@@ -251,14 +290,62 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
     }
   }, [lxmf.fetchMessages]);
 
-  // lxmf.send expects body as base64 (JNI decodes it to raw bytes before LXMF framing).
-  // This wrapper accepts plain UTF-8 text and encodes it so callers don't need to know the wire format.
+  // Auto-routes to DM or group send based on destination address
   const lxmfSend = lxmf.send;
+  const lxmfSendGroup = lxmf.sendGroup;
   const send = useCallback(async (dest: string, body: string): Promise<number> => {
     const bytes = new TextEncoder().encode(body);
     const b64 = btoa(String.fromCodePoint(...bytes));
+    if (groupMapRef.current[dest]) {
+      return lxmfSendGroup(dest, b64);
+    }
     return lxmfSend(dest, b64);
-  }, [lxmfSend]);
+  }, [lxmfSend, lxmfSendGroup]);
+
+  // ── Group operations ──────────────────────────────────────────────────────
+
+  const createGroup = useCallback((name: string): string => {
+    const keyHex = generateKeyHex();
+    const addrHex = lxmf.createGroup(name, keyHex);
+    const group: Group = { addrHex, name, keyHex };
+    const newMap = { ...groupMapRef.current, [addrHex]: group };
+    groupMapRef.current = newMap;
+    persistGroups(Object.values(newMap));
+    return addrHex;
+  }, [lxmf.createGroup, persistGroups]);
+
+  const joinGroup = useCallback((addrHex: string, keyHex: string): boolean => {
+    const ok = lxmf.joinGroup(addrHex, keyHex);
+    if (ok) {
+      const group: Group = { addrHex, name: addrHex.slice(0, 8), keyHex };
+      const newMap = { ...groupMapRef.current, [addrHex]: group };
+      groupMapRef.current = newMap;
+      persistGroups(Object.values(newMap));
+    }
+    return ok;
+  }, [lxmf.joinGroup, persistGroups]);
+
+  const leaveGroup = useCallback((addrHex: string) => {
+    lxmf.leaveGroup(addrHex);
+    const newMap = { ...groupMapRef.current };
+    delete newMap[addrHex];
+    groupMapRef.current = newMap;
+    persistGroups(Object.values(newMap));
+  }, [lxmf.leaveGroup, persistGroups]);
+
+  const isGroup = useCallback((addrHex: string): boolean => {
+    return !!groupMapRef.current[addrHex];
+  }, []);
+
+  const shareGroupInvite = useCallback(async (addrHex: string) => {
+    const g = groupMapRef.current[addrHex];
+    if (!g) return;
+    const invite = JSON.stringify({ groupAddr: g.addrHex, keyHex: g.keyHex, name: g.name });
+    await Share.share({
+      message: `Join my LXMF group "${g.name}"\n\nAddr: ${g.addrHex}\nKey: ${g.keyHex}\n\nInvite payload: ${invite}`,
+      title: `LXMF Group Invite — ${g.name}`,
+    });
+  }, []);
 
   const value = useMemo<LxmfContextValue>(() => ({
     isNativeAvailable: lxmf.isNativeAvailable,
@@ -280,11 +367,18 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
     contacts,
     upsertContact,
     markRead,
+    groups,
+    createGroup,
+    joinGroup,
+    leaveGroup,
+    isGroup,
+    shareGroupInvite,
   }), [
     lxmf.isNativeAvailable, lxmf.isRunning, lxmf.status, lxmf.error, lxmf.events,
     lxmf.start, lxmf.stop, lxmf.getStatus, lxmf.setLogLevel,
     send, fetchMessages, identity, identityHydrated, clearIdentity,
     displayName, setDisplayName, contacts, upsertContact, markRead,
+    groups, createGroup, joinGroup, leaveGroup, isGroup, shareGroupInvite,
   ]);
 
   return (
