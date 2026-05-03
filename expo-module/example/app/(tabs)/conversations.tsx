@@ -130,7 +130,7 @@ function GroupModal({ visible, onClose, onCreated, onJoined, createGroup, joinGr
     const addr = joinAddr.trim().toLowerCase();
     const key = joinKey.trim().toLowerCase();
     if (!/^[0-9a-f]{32}$/.test(addr)) { setErr('Address must be 32 hex chars.'); return; }
-    if (!/^[0-9a-f]{64}$/.test(key)) { setErr('Key must be 64 hex chars (32 bytes).'); return; }
+    if (!/^[0-9a-f]{32}$/.test(key)) { setErr('Key must be 32 hex chars (16 bytes).'); return; }
     const ok = joinGroup(addr, key);
     if (ok) { onJoined(addr); handleClose(); }
     else { setErr('Failed to join group.'); }
@@ -190,7 +190,7 @@ function GroupModal({ visible, onClose, onCreated, onJoined, createGroup, joinGr
                 <Text selectable style={S.inviteValue}>{created.name}</Text>
                 <Text style={S.inviteLabel}>Address (32 hex)</Text>
                 <Text selectable style={S.inviteValue}>{created.addrHex}</Text>
-                <Text style={S.inviteLabel}>Key (64 hex)</Text>
+                <Text style={S.inviteLabel}>Key (32 hex)</Text>
                 <Text selectable style={S.inviteValue}>{created.keyHex}</Text>
               </View>
               <View style={S.modalBtns}>

@@ -138,12 +138,11 @@ function sortedContacts(map: Record<string, Contact>): Contact[] {
 }
 
 function generateKeyHex(): string {
-  const buf = new Uint8Array(32);
+  const buf = new Uint8Array(16); // Rust group_encrypt uses AES-128: 16-byte key
   const cryptoApi = globalThis.crypto ?? (globalThis as Record<string, any>).msCrypto;
   if (cryptoApi?.getRandomValues) {
     cryptoApi.getRandomValues(buf);
   } else {
-    // Hermes < 0.12 or non-standard env: insecure fallback
     for (let i = 0; i < buf.length; i++) {
       buf[i] = Math.trunc(Math.random() * 256);
     }
