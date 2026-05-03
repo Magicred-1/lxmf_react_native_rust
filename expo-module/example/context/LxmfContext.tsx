@@ -1,7 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import * as SecureStore from 'expo-secure-store';
 import { Share } from 'react-native';
-import { documentDirectory } from 'expo-file-system/legacy';
+import { documentDirectory, readAsStringAsync, writeAsStringAsync } from 'expo-file-system/legacy';
 import {
   useLxmf,
   LxmfNodeMode,
@@ -13,8 +13,20 @@ const DB_PATH = documentDirectory
   ? documentDirectory.replace('file://', '') + 'lxmf.db'
   : undefined;
 
+// Contacts are not sensitive — stored as a plain file to avoid SecureStore 2048B limit
+const CONTACTS_FILE = documentDirectory ? documentDirectory + 'lxmf_contacts.json' : null;
+
+async function readContactsFile(): Promise<string | null> {
+  if (!CONTACTS_FILE) return null;
+  try { return await readAsStringAsync(CONTACTS_FILE); } catch { return null; }
+}
+
+async function writeContactsFile(json: string): Promise<void> {
+  if (!CONTACTS_FILE) return;
+  try { await writeAsStringAsync(CONTACTS_FILE, json); } catch {}
+}
+
 const IDENTITY_KEY = 'lxmf.identity.v1';
-const CONTACTS_KEY = 'lxmf.contacts.v1';
 const DISPLAY_NAME_KEY = 'lxmf.displayName';
 const GROUPS_KEY = 'lxmf.groups.v1';
 
@@ -178,7 +190,7 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
         if (isValidIdentity(parsed)) setIdentity(parsed);
       } catch {}
       try {
-        const raw = await SecureStore.getItemAsync(CONTACTS_KEY);
+        const raw = await readContactsFile();
         const map = tryJson<Record<string, Contact>>(raw, {});
         contactMapRef.current = map;
         setContacts(sortedContacts(map));
@@ -227,7 +239,7 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
 
   const persistContacts = useCallback((map: Record<string, Contact>) => {
     setContacts(sortedContacts(map));
-    SecureStore.setItemAsync(CONTACTS_KEY, JSON.stringify(map)).catch(() => {});
+    writeContactsFile(JSON.stringify(map));
   }, []);
 
   const persistGroups = useCallback((list: Group[]) => {
