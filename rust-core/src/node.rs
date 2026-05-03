@@ -712,8 +712,8 @@ impl LxmfNode {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        use rns_transport::packet::DestinationType;
-                        if msg.packet.header.destination_type != DestinationType::Group { continue; }
+                        // Match on destination address — don't gate on DestinationType::Group
+                        // because the wire type bit may differ from what we set in send_packet.
                         let Ok(dest): Result<[u8; 16], _> = msg.packet.destination.as_slice().try_into() else { continue };
                         let Some(key) = crate::group::lookup_key(&dest) else { continue };
                         let raw = msg.packet.data.as_slice();
@@ -1253,8 +1253,6 @@ impl LxmfNode {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        use rns_transport::packet::DestinationType;
-                        if msg.packet.header.destination_type != DestinationType::Group { continue; }
                         let Ok(dest): Result<[u8; 16], _> = msg.packet.destination.as_slice().try_into() else { continue };
                         let Some(key) = crate::group::lookup_key(&dest) else { continue };
                         let raw = msg.packet.data.as_slice();
@@ -1987,8 +1985,6 @@ impl LxmfNode {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        use rns_transport::packet::DestinationType;
-                        if msg.packet.header.destination_type != DestinationType::Group { continue; }
                         let Ok(dest): Result<[u8; 16], _> = msg.packet.destination.as_slice().try_into() else { continue };
                         let Some(key) = crate::group::lookup_key(&dest) else { continue };
                         let raw = msg.packet.data.as_slice();
