@@ -7,7 +7,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
 
-use log::warn;
+use log::{error, warn};
 use crate::node::{LxmfNode, DestHash};
 
 pub const STATUS_OK: i32 = 0;

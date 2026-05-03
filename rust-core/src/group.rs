@@ -11,7 +11,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rns_transport::destination::{DestinationName, EmptyIdentity, PlainInputDestination};
+use rns_transport::destination::{DestinationName, PlainInputDestination};
+use rns_transport::identity::EmptyIdentity;
 
 pub use rns_transport::destination::{group_decrypt, group_encrypt};
 
