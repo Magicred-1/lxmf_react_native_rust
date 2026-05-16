@@ -39,6 +39,3 @@ rns-core = { package = "reticulum-rs-core", version = "0.2.0", git = "https://gi
 default = []
 fernet-aes128 = []
 
-[lints.rust]
-unsafe_code = "forbid"
-unused_imports = "warn"
