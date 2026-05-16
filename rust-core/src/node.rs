@@ -141,7 +141,7 @@ impl LxmfNode {
         }).transpose()?;
 
         let node = LxmfNode {
-            events: Arc::new(Mutex::new(VecDeque::with_capacity(256))),
+            events: Arc::new(Mutex::new(VecDeque::with_capacity(4096))),
             beacon_mgr: Arc::new(std::sync::Mutex::new(BeaconManager::new())),
             store,
             running: false,
@@ -521,7 +521,7 @@ impl LxmfNode {
                         let event = lxmf_event_from_bytes(src, data, None);
                         persist_inbound_message(&store_data, &event);
                         if let Ok(mut eq) = events_data.lock() {
-                            if eq.len() < 1024 {
+                            if eq.len() < 4096 {
                                 eq.push_back(event);
                             } else {
                                 warn!("LxmfNode: event queue full, dropping inbound message");
@@ -1036,7 +1036,7 @@ impl LxmfNode {
                         let event = lxmf_event_from_bytes(src, data, None);
                         persist_inbound_message(&store_data, &event);
                         if let Ok(mut eq) = events_data.lock() {
-                            if eq.len() < 1024 {
+                            if eq.len() < 4096 {
                                 eq.push_back(event);
                             } else {
                                 warn!("LxmfNode full: event queue full, dropping inbound message");
@@ -1880,7 +1880,7 @@ impl LxmfNode {
                         let event = lxmf_event_from_bytes(src, data, None);
                         persist_inbound_message(&store_data, &event);
                         if let Ok(mut eq) = events_data.lock() {
-                            if eq.len() < 1024 {
+                            if eq.len() < 4096 {
                                 eq.push_back(event);
                             } else {
                                 warn!("LxmfNode BLE: event queue full, dropping inbound message");
