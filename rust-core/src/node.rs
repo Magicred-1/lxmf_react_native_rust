@@ -485,12 +485,12 @@ impl LxmfNode {
                             if is_beacon_mode && crate::beacon_server::is_rpc_request(&data) {
                                 // Beacon mode: handle incoming request and reply on the same link.
                                 let link_id = received.destination.clone();
-                                let (keypair, solana_url) = {
+                                let (keypair, solana_url, program_id) = {
                                     let cfg = beacon_config_rx.lock().unwrap_or_else(|p| p.into_inner());
-                                    (cfg.keypair.clone(), cfg.solana_rpc_url.clone())
+                                    (cfg.keypair.clone(), cfg.solana_rpc_url.clone(), cfg.program_id)
                                 };
-                                if let (Some(kp), Some(url)) = (keypair, solana_url) {
-                                    let response = crate::beacon_server::handle_rpc_request(&data, &kp, &url).await;
+                                if let (Some(kp), Some(url), Some(pid)) = (keypair, solana_url, program_id) {
+                                    let response = crate::beacon_server::handle_rpc_request(&data, &kp, &url, pid).await;
                                     let t = transport_data.lock().await;
                                     if let Some(link) = t.find_in_link(&link_id).await {
                                         let _ = rns_transport::delivery::send_on_link(&t, &link, &response).await;
@@ -498,7 +498,7 @@ impl LxmfNode {
                                         warn!("LxmfNode beacon: no in-link {:?} to send RPC response", link_id);
                                     }
                                 } else {
-                                    warn!("LxmfNode beacon: RPC request received but keypair/solana_url not set");
+                                    warn!("LxmfNode beacon: RPC request received but keypair/solana_url/program_id not set");
                                 }
                             } else {
                                 // Client mode: correlate as a beacon RPC response.
@@ -1048,12 +1048,12 @@ impl LxmfNode {
                         if looks_like_rpc_response(&data) {
                             if is_beacon_mode && crate::beacon_server::is_rpc_request(&data) {
                                 let link_id = received.destination.clone();
-                                let (keypair, solana_url) = {
+                                let (keypair, solana_url, program_id) = {
                                     let cfg = beacon_config_rx.lock().unwrap_or_else(|p| p.into_inner());
-                                    (cfg.keypair.clone(), cfg.solana_rpc_url.clone())
+                                    (cfg.keypair.clone(), cfg.solana_rpc_url.clone(), cfg.program_id)
                                 };
-                                if let (Some(kp), Some(url)) = (keypair, solana_url) {
-                                    let response = crate::beacon_server::handle_rpc_request(&data, &kp, &url).await;
+                                if let (Some(kp), Some(url), Some(pid)) = (keypair, solana_url, program_id) {
+                                    let response = crate::beacon_server::handle_rpc_request(&data, &kp, &url, pid).await;
                                     let t = transport_data.lock().await;
                                     if let Some(link) = t.find_in_link(&link_id).await {
                                         let _ = rns_transport::delivery::send_on_link(&t, &link, &response).await;
@@ -1061,7 +1061,7 @@ impl LxmfNode {
                                         warn!("LxmfNode full beacon: no in-link {:?} to send RPC response", link_id);
                                     }
                                 } else {
-                                    warn!("LxmfNode full beacon: RPC request received but keypair/solana_url not set");
+                                    warn!("LxmfNode full beacon: RPC request received but keypair/solana_url/program_id not set");
                                 }
                             } else {
                                 if let Ok(mut mgr) = beacon_arc_data.lock() {

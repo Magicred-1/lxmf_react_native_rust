@@ -7,6 +7,9 @@ import {
   LxmfNodeMode,
   type LxmfEvent,
   type LxmfNodeStatus,
+  type Beacon,
+  type ExecutePaymentAccounts,
+  type ExecutePaymentParams,
 } from '@magicred-1/react-native-lxmf';
 
 const DB_PATH = documentDirectory
@@ -104,6 +107,17 @@ export type LxmfContextValue = {
   // Beacon server config
   setBeaconKeypair: (keyHex: string) => boolean;
   setBeaconSolanaRpc: (url: string) => boolean;
+  // Client beacon API
+  beacons: Beacon[];
+  beaconRpc: (destHashHex: string, method: string, params?: unknown) => Promise<number>;
+  beaconRpcWait: (destHashHex: string, method: string, params?: unknown, timeoutMs?: number) => Promise<{ resultJson: string; isError: boolean }>;
+  beaconBroadcastRpc: (method: string, params?: unknown, timeoutMs?: number) => Promise<{ resultJson: string; isError: boolean; beaconHash: string }>;
+  cosignAndSubmit: (destHashHex: string, partialTxB64: string, timeoutMs?: number) => Promise<string>;
+  // Payment / program ID
+  setProgramId: (programIdHex: string) => boolean;
+  getProgramId: () => string | null;
+  partialSignExecutePayment: (payerKeyHex: string, nonceBlockhashHex: string, accounts: ExecutePaymentAccounts, params: ExecutePaymentParams) => string | null;
+  extractNonceBlockhash: (accountDataB64: string) => string | null;
   // Groups
   groups: Group[];
   createGroup: (name: string) => { addrHex: string; keyHex: string };
@@ -392,6 +406,15 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
     markRead,
     setBeaconKeypair: lxmf.setBeaconKeypair,
     setBeaconSolanaRpc: lxmf.setBeaconSolanaRpc,
+    beacons: lxmf.beacons,
+    beaconRpc: lxmf.beaconRpc,
+    beaconRpcWait: lxmf.beaconRpcWait,
+    beaconBroadcastRpc: lxmf.beaconBroadcastRpc,
+    cosignAndSubmit: lxmf.cosignAndSubmit,
+    setProgramId: lxmf.setProgramId,
+    getProgramId: lxmf.getProgramId,
+    partialSignExecutePayment: lxmf.partialSignExecutePayment,
+    extractNonceBlockhash: lxmf.extractNonceBlockhash,
     groups,
     createGroup,
     joinGroup,
@@ -402,6 +425,9 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
     lxmf.isNativeAvailable, lxmf.isRunning, lxmf.status, lxmf.error, lxmf.events,
     lxmf.start, lxmf.stop, lxmf.getStatus, lxmf.setLogLevel,
     lxmf.setBeaconKeypair, lxmf.setBeaconSolanaRpc,
+    lxmf.beacons, lxmf.beaconRpc, lxmf.beaconRpcWait, lxmf.beaconBroadcastRpc,
+    lxmf.cosignAndSubmit, lxmf.setProgramId, lxmf.getProgramId,
+    lxmf.partialSignExecutePayment, lxmf.extractNonceBlockhash,
     send, fetchMessages, identity, identityHydrated, clearIdentity,
     displayName, setDisplayName, contacts, upsertContact, markRead,
     groups, createGroup, joinGroup, leaveGroup, isGroup, shareGroupInvite,

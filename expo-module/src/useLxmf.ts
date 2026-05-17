@@ -446,6 +446,74 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     }
   }, []);
 
+  /**
+   * Call a specific beacon by destHash and await the response.
+   * Resolves when the matching `onRpcResponse` event arrives, rejects on timeout.
+   */
+  const beaconRpcWait = useCallback(async (
+    destHashHex: string,
+    method: string,
+    params?: unknown,
+    timeoutMs = 30_000,
+  ): Promise<{ resultJson: string; isError: boolean }> => {
+    const paramsJson = params === undefined ? null : JSON.stringify(params);
+    const id = await LxmfModule.beaconRpc(destHashHex, method, paramsJson);
+    if (id < 0) throw new Error(`beaconRpc(${method}): send failed`);
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        sub?.remove();
+        reject(new Error(`beaconRpc(${method}) timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      const sub = (LxmfModuleNative as any)?.addListener('onRpcResponse', (event: any) => {
+        if (event.id !== id) return;
+        clearTimeout(timer);
+        sub?.remove();
+        resolve({ resultJson: event.resultJson, isError: event.isError });
+      });
+
+      if (sub == null) { clearTimeout(timer); reject(new Error('Native module unavailable')); }
+    });
+  }, []);
+
+  /**
+   * Send the same RPC call to ALL discovered beacons simultaneously.
+   * Resolves with the first successful response and the responding beacon's destHash.
+   */
+  const beaconBroadcastRpc = useCallback(async (
+    method: string,
+    params?: unknown,
+    timeoutMs = 30_000,
+  ): Promise<{ resultJson: string; isError: boolean; beaconHash: string }> => {
+    const raw = LxmfModule.getBeacons();
+    const list: Array<{ destHash: string }> = raw ? JSON.parse(raw) : [];
+    if (list.length === 0) throw new Error('No beacons discovered yet');
+    return Promise.any(
+      list.map(b =>
+        beaconRpcWait(b.destHash, method, params, timeoutMs)
+          .then(res => ({ ...res, beaconHash: b.destHash }))
+      )
+    );
+  }, [beaconRpcWait]);
+
+  /**
+   * Submit a partial transaction to a beacon for co-signing and Solana broadcast.
+   * Returns the Solana transaction signature string.
+   */
+  const cosignAndSubmit = useCallback(async (
+    destHashHex: string,
+    partialTxB64: string,
+    timeoutMs = 60_000,
+  ): Promise<string> => {
+    const { resultJson, isError } = await beaconRpcWait(
+      destHashHex, 'cosignTransaction', [partialTxB64], timeoutMs
+    );
+    const parsed = JSON.parse(resultJson);
+    if (isError) throw new Error(parsed?.message ?? 'cosignAndSubmit failed');
+    return parsed?.result ?? '';
+  }, [beaconRpcWait]);
+
   const setProgramId = useCallback((programIdHex: string): boolean => {
     try { return LxmfModule.setProgramId(programIdHex); }
     catch (e: any) { setError(e?.message ?? 'setProgramId failed'); return false; }
@@ -550,6 +618,9 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     getNusUnpairedRNodes,
     pairNusRNode,
     beaconRpc,
+    beaconRpcWait,
+    beaconBroadcastRpc,
+    cosignAndSubmit,
     setProgramId,
     getProgramId,
     setBeaconKeypair,

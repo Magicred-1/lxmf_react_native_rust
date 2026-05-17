@@ -14,8 +14,9 @@ import * as SecureStore from 'expo-secure-store';
 import { LxmfModule, LxmfNodeMode } from '@magicred-1/react-native-lxmf';
 import { useLxmfContext } from '@/context/LxmfContext';
 
-const BEACON_KEYPAIR_KEY = 'lxmf_beacon_keypair_hex';
-const BEACON_RPC_KEY     = 'lxmf_beacon_rpc_url';
+const BEACON_KEYPAIR_KEY   = 'lxmf_beacon_keypair_hex';
+const BEACON_RPC_KEY       = 'lxmf_beacon_rpc_url';
+const BEACON_PROGRAM_ID_KEY = 'lxmf_beacon_program_id';
 
 function shortHex(v: string): string {
   if (!v || v.length <= 12) return v || '—';
@@ -38,7 +39,12 @@ function Row({ label, value }: Readonly<{ label: string; value: string }>) {
 // ── Main screen ───────────────────────────────────────────────────────────────
 
 export default function NetworkScreen() {
-  const { isRunning, isNativeAvailable, status, error, identityHydrated, displayName, start, stop, getStatus, setBeaconKeypair, setBeaconSolanaRpc } = useLxmfContext();
+  const {
+    isRunning, isNativeAvailable, status, error, identityHydrated, displayName,
+    start, stop, getStatus,
+    setBeaconKeypair, setBeaconSolanaRpc, setProgramId,
+    beacons, beaconRpcWait, beaconBroadcastRpc,
+  } = useLxmfContext();
 
   const [tab, setTab] = useState<TransportTab>('both');
   const [tcpHost, setTcpHost] = useState('192.168.1.135');
@@ -50,6 +56,10 @@ export default function NetworkScreen() {
   const [msg, setMsg] = useState('');
   const [bleCount, setBleCount] = useState(0);
   const [unpairedCount, setUnpairedCount] = useState(0);
+  const [programIdHex, setProgramIdHex] = useState('');
+  const [selectedBeacon, setSelectedBeacon] = useState<string | null>(null);
+  const [rpcLoading, setRpcLoading] = useState(false);
+  const [rpcResult, setRpcResult] = useState<string | null>(null);
 
   // Poll BLE peer count while running
   useEffect(() => {
@@ -74,6 +84,7 @@ export default function NetworkScreen() {
   useEffect(() => {
     SecureStore.getItemAsync(BEACON_KEYPAIR_KEY).then(v => { if (v) setBeaconKeyHex(v); }).catch(() => {});
     SecureStore.getItemAsync(BEACON_RPC_KEY).then(v => { if (v) setBeaconRpcUrl(v); }).catch(() => {});
+    SecureStore.getItemAsync(BEACON_PROGRAM_ID_KEY).then(v => { if (v) setProgramIdHex(v); }).catch(() => {});
   }, []);
 
   // Persist beacon keypair when it changes (only in beacon mode)
@@ -87,6 +98,12 @@ export default function NetworkScreen() {
     if (!isBeacon) return;
     SecureStore.setItemAsync(BEACON_RPC_KEY, beaconRpcUrl).catch(() => {});
   }, [beaconRpcUrl, isBeacon]);
+
+  // Persist program ID when it changes (only in beacon mode)
+  useEffect(() => {
+    if (!isBeacon || !programIdHex) return;
+    SecureStore.setItemAsync(BEACON_PROGRAM_ID_KEY, programIdHex).catch(() => {});
+  }, [programIdHex, isBeacon]);
 
   const requestBlePerms = async (): Promise<boolean> => {
     if (Platform.OS !== 'android') return true;
@@ -107,8 +124,10 @@ export default function NetworkScreen() {
 
     if (isBeacon) {
       if (beaconKeyHex.length !== 64) { setMsg('Beacon keypair must be 64 hex chars (32-byte seed).'); return; }
+      if (programIdHex.length !== 64) { setMsg('Program ID must be 64 hex chars (32-byte address).'); return; }
       setBeaconKeypair(beaconKeyHex);
       setBeaconSolanaRpc(beaconRpcUrl.trim());
+      setProgramId(programIdHex.trim());
     }
 
     if (tab === 'ble') {
@@ -125,7 +144,7 @@ export default function NetworkScreen() {
       const ok = await start({ mode, tcpInterfaces: [{ host, port }], displayName: name, isBeacon });
       if (!ok) setMsg('Failed to start node.');
     }
-  }, [tab, tcpHost, tcpPort, localName, isBeacon, beaconKeyHex, beaconRpcUrl, start, setBeaconKeypair, setBeaconSolanaRpc]);
+  }, [tab, tcpHost, tcpPort, localName, isBeacon, beaconKeyHex, beaconRpcUrl, programIdHex, start, setBeaconKeypair, setBeaconSolanaRpc, setProgramId]);
 
   const onStop = useCallback(async () => {
     await stop();
@@ -204,6 +223,16 @@ export default function NetworkScreen() {
             />
             <TextInput
               style={S.input}
+              placeholder="Program ID (64 hex chars)"
+              placeholderTextColor="#4a6070"
+              value={programIdHex}
+              onChangeText={setProgramIdHex}
+              autoCapitalize="none"
+              autoCorrect={false}
+              editable={!isRunning}
+            />
+            <TextInput
+              style={S.input}
               placeholder="Solana RPC URL"
               placeholderTextColor="#4a6070"
               value={beaconRpcUrl}
@@ -259,6 +288,84 @@ export default function NetworkScreen() {
         <Row label="Announces received" value={String(status?.announcesReceived ?? 0)} />
         <Row label="Inbound accepted" value={String(status?.inboundAccepted ?? 0)} />
       </View>
+
+      {/* ── Beacon list ──────────────────────────────────────────────── */}
+      {isRunning && (
+        <View style={S.card}>
+          <Text style={S.cardTitle}>Beacons ({beacons.length})</Text>
+          {beacons.length === 0
+            ? <Text style={S.emptyHint}>No beacons discovered yet — waiting for announces…</Text>
+            : beacons.map(b => (
+                <Pressable
+                  key={b.destHash}
+                  style={[S.beaconRow, selectedBeacon === b.destHash && S.beaconRowSelected]}
+                  onPress={() => setSelectedBeacon(prev => prev === b.destHash ? null : b.destHash)}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={S.beaconHash}>{shortHex(b.destHash)}</Text>
+                    <Text style={S.beaconMeta}>{b.state} · {Math.round((Date.now() / 1000 - b.lastAnnounce) / 60)}m ago</Text>
+                  </View>
+                  {selectedBeacon === b.destHash && <Text style={S.beaconCheck}>✓</Text>}
+                </Pressable>
+              ))
+          }
+        </View>
+      )}
+
+      {/* ── RPC demo panel ───────────────────────────────────────────── */}
+      {isRunning && beacons.length > 0 && (
+        <View style={S.card}>
+          <Text style={S.cardTitle}>Beacon RPC</Text>
+          {!selectedBeacon && (
+            <Text style={S.emptyHint}>Select a beacon above to use targeted ping, or use broadcast.</Text>
+          )}
+          <View style={S.btnRow}>
+            <Pressable
+              style={({ pressed }) => [S.btn, (!selectedBeacon || rpcLoading) && S.btnDisabled, pressed && S.btnPressed]}
+              disabled={!selectedBeacon || rpcLoading}
+              onPress={async () => {
+                if (!selectedBeacon) return;
+                setRpcLoading(true);
+                setRpcResult(null);
+                try {
+                  const res = await beaconRpcWait(selectedBeacon, 'getLatestBlockhash', [{ commitment: 'confirmed' }]);
+                  const parsed = JSON.parse(res.resultJson);
+                  const blockhash = parsed?.result?.value?.blockhash ?? parsed?.result ?? res.resultJson;
+                  setRpcResult(`blockhash: ${blockhash}\nvia: ${shortHex(selectedBeacon)}`);
+                } catch (e: any) {
+                  setRpcResult(`error: ${e?.message ?? String(e)}`);
+                } finally {
+                  setRpcLoading(false);
+                }
+              }}>
+              <Text style={S.btnText}>{rpcLoading ? '…' : 'Ping (targeted)'}</Text>
+            </Pressable>
+            <Pressable
+              style={({ pressed }) => [S.btn, rpcLoading && S.btnDisabled, pressed && S.btnPressed]}
+              disabled={rpcLoading}
+              onPress={async () => {
+                setRpcLoading(true);
+                setRpcResult(null);
+                try {
+                  const res = await beaconBroadcastRpc('getLatestBlockhash', [{ commitment: 'confirmed' }]);
+                  const parsed = JSON.parse(res.resultJson);
+                  const blockhash = parsed?.result?.value?.blockhash ?? parsed?.result ?? res.resultJson;
+                  setRpcResult(`blockhash: ${blockhash}\nvia: ${shortHex(res.beaconHash)}`);
+                } catch (e: any) {
+                  setRpcResult(`error: ${e?.message ?? String(e)}`);
+                } finally {
+                  setRpcLoading(false);
+                }
+              }}>
+              <Text style={S.btnText}>{rpcLoading ? '…' : 'Ping (broadcast)'}</Text>
+            </Pressable>
+          </View>
+          {rpcResult !== null && (
+            <ScrollView style={S.rpcResultBox} nestedScrollEnabled>
+              <Text style={S.rpcResultText}>{rpcResult}</Text>
+            </ScrollView>
+          )}
+        </View>
+      )}
     </ScrollView>
   );
 }
@@ -313,4 +420,19 @@ const S = StyleSheet.create({
   statRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 2 },
   statLabel: { color: '#7a9db5', fontSize: 13 },
   statValue: { color: '#d8ecf8', fontSize: 13, fontFamily: 'monospace' },
+
+  emptyHint: { color: '#4a6070', fontSize: 12, fontStyle: 'italic' },
+
+  beaconRow: {
+    flexDirection: 'row', alignItems: 'center', paddingVertical: 8,
+    paddingHorizontal: 10, borderRadius: 8, borderWidth: 1,
+    borderColor: '#1e3040', backgroundColor: '#0e1923',
+  },
+  beaconRowSelected: { borderColor: '#1a7fc1', backgroundColor: '#0d3550' },
+  beaconHash: { color: '#d8ecf8', fontSize: 13, fontFamily: 'monospace' },
+  beaconMeta: { color: '#4a6070', fontSize: 11, marginTop: 2 },
+  beaconCheck: { color: '#4fb3e8', fontSize: 16, marginLeft: 8 },
+
+  rpcResultBox: { maxHeight: 120, backgroundColor: '#080f16', borderRadius: 8, padding: 8, marginTop: 4 },
+  rpcResultText: { color: '#7affb2', fontSize: 12, fontFamily: 'monospace' },
 });

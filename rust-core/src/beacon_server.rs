@@ -56,6 +56,7 @@ pub async fn handle_rpc_request(
     data: &[u8],
     keypair: &ed25519_dalek::SigningKey,
     solana_rpc_url: &str,
+    program_id: [u8; 32],
 ) -> Vec<u8> {
     let raw = match decompress_payload(data) {
         Ok(r) => r,
@@ -68,7 +69,7 @@ pub async fn handle_rpc_request(
 
     let id = req.id;
     match req.method.as_str() {
-        "cosignTransaction" => cosign_and_submit(id, &req.params, keypair, solana_rpc_url).await,
+        "cosignTransaction" => cosign_and_submit(id, &req.params, keypair, solana_rpc_url, program_id).await,
         method => proxy_solana(id, method, req.params, solana_rpc_url).await,
     }
 }
@@ -87,6 +88,7 @@ async fn cosign_and_submit(
     params: &serde_json::Value,
     keypair: &ed25519_dalek::SigningKey,
     solana_rpc_url: &str,
+    program_id: [u8; 32],
 ) -> Vec<u8> {
     // params is a JSON array; element 0 is the base64 partial tx
     let partial_tx_b64 = match params.get(0).and_then(|v| v.as_str()) {
@@ -119,9 +121,9 @@ async fn cosign_and_submit(
     // Sign the Solana message bytes (everything after the signature array)
     let message_bytes = tx_bytes[msg_start..].to_vec();
 
-    if !verify_execute_payment_discriminator(&message_bytes) {
+    if !verify_execute_payment_instruction(&message_bytes, &program_id) {
         return error_response(request_id, -32602,
-            "cosignTransaction: transaction is not an execute_payment instruction");
+            "cosignTransaction: not a valid execute_payment for the configured program");
     }
 
     let sig: ed25519_dalek::Signature = keypair.sign(&message_bytes);
@@ -183,13 +185,15 @@ async fn proxy_solana(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Verify the Solana legacy message contains an `execute_payment` Anchor instruction
-/// as its first (and expected only) instruction.
+/// Verify the Solana legacy message's first instruction is an `execute_payment` call
+/// targeting the configured `program_id`.
 ///
-/// Parses the wire-format message header → accounts → blockhash → first instruction data
-/// and checks the opening 8 bytes against the Anchor discriminator for `execute_payment`.
-/// Returns false on any parse failure or discriminator mismatch.
-fn verify_execute_payment_discriminator(message_bytes: &[u8]) -> bool {
+/// Checks both:
+///   1. The instruction's program account key matches `program_id`
+///   2. The instruction data begins with the Anchor discriminator for `execute_payment`
+///
+/// Returns false on any parse failure, program mismatch, or discriminator mismatch.
+fn verify_execute_payment_instruction(message_bytes: &[u8], program_id: &[u8; 32]) -> bool {
     // Solana legacy message wire format:
     //   [3 bytes]        header (num_required_sigs, num_readonly_signed, num_readonly_unsigned)
     //   [compact_u16]    account_keys count (N)
@@ -197,7 +201,7 @@ fn verify_execute_payment_discriminator(message_bytes: &[u8]) -> bool {
     //   [32 bytes]       recent_blockhash
     //   [compact_u16]    instruction count
     //   --- first instruction ---
-    //   [1 byte]         program_id_index
+    //   [1 byte]         program_id_index  → index into account_keys
     //   [compact_u16]    account_indices count (M)
     //   [M × 1 byte]     account indices
     //   [compact_u16]    data length
@@ -212,8 +216,8 @@ fn verify_execute_payment_discriminator(message_bytes: &[u8]) -> bool {
     cur += n;
     let account_bytes = (account_count as usize).saturating_mul(32);
     if cur + account_bytes + 32 > message_bytes.len() { return false; }
-    cur += account_bytes; // skip account keys
-    cur += 32;            // skip recent blockhash
+    let account_keys = &message_bytes[cur..cur + account_bytes];
+    cur += account_bytes + 32; // skip account keys + recent blockhash
 
     let (ix_count, n) = match read_compact_u16(&message_bytes[cur..]) {
         Some(v) => v, None => return false,
@@ -223,7 +227,13 @@ fn verify_execute_payment_discriminator(message_bytes: &[u8]) -> bool {
 
     // First instruction: program_id_index (1 byte)
     if cur >= message_bytes.len() { return false; }
+    let pid_idx = message_bytes[cur] as usize;
     cur += 1;
+
+    // Verify the program account key matches the stored program_id
+    let key_start = pid_idx.saturating_mul(32);
+    if key_start + 32 > account_keys.len() { return false; }
+    if &account_keys[key_start..key_start + 32] != program_id.as_slice() { return false; }
 
     // Account indices
     let (acct_idx_count, n) = match read_compact_u16(&message_bytes[cur..]) {
@@ -233,7 +243,7 @@ fn verify_execute_payment_discriminator(message_bytes: &[u8]) -> bool {
     if cur + acct_idx_count as usize > message_bytes.len() { return false; }
     cur += acct_idx_count as usize;
 
-    // Instruction data
+    // Instruction data discriminator check
     let (data_len, n) = match read_compact_u16(&message_bytes[cur..]) {
         Some(v) => v, None => return false,
     };
@@ -373,25 +383,38 @@ mod tests {
         msg
     }
 
+    // make_message_with_discriminator sets program_id_index = 2 and all account keys = [0u8; 32],
+    // so the expected program_id for these tests is [0u8; 32].
+    const ZERO_PROGRAM_ID: [u8; 32] = [0u8; 32];
+
     #[test]
     fn discriminator_check_accepts_execute_payment() {
         let disc = crate::solana_tx::anchor_discriminator("execute_payment");
         let msg = make_message_with_discriminator(disc);
-        assert!(verify_execute_payment_discriminator(&msg));
+        assert!(verify_execute_payment_instruction(&msg, &ZERO_PROGRAM_ID));
     }
 
     #[test]
     fn discriminator_check_rejects_other_instruction() {
-        // SystemProgram::Transfer has no Anchor discriminator — simulate with wrong 8 bytes
+        // Anchor discriminator for a different method — same program, wrong instruction
         let wrong_disc = [0u8; 8];
         let msg = make_message_with_discriminator(wrong_disc);
-        assert!(!verify_execute_payment_discriminator(&msg));
+        assert!(!verify_execute_payment_instruction(&msg, &ZERO_PROGRAM_ID));
     }
 
     #[test]
     fn discriminator_check_rejects_truncated_message() {
-        assert!(!verify_execute_payment_discriminator(&[]));
-        assert!(!verify_execute_payment_discriminator(&[0u8; 10]));
+        assert!(!verify_execute_payment_instruction(&[], &ZERO_PROGRAM_ID));
+        assert!(!verify_execute_payment_instruction(&[0u8; 10], &ZERO_PROGRAM_ID));
+    }
+
+    #[test]
+    fn discriminator_check_rejects_wrong_program_id() {
+        let disc = crate::solana_tx::anchor_discriminator("execute_payment");
+        let msg = make_message_with_discriminator(disc);
+        // Correct discriminator but wrong program_id → must reject
+        let wrong_program_id = [0xFFu8; 32];
+        assert!(!verify_execute_payment_instruction(&msg, &wrong_program_id));
     }
 
     #[test]
