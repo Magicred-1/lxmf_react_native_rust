@@ -112,7 +112,7 @@ export type LxmfContextValue = {
   beaconRpc: (destHashHex: string, method: string, params?: unknown) => Promise<number>;
   beaconRpcWait: (destHashHex: string, method: string, params?: unknown, timeoutMs?: number) => Promise<{ resultJson: string; isError: boolean }>;
   beaconBroadcastRpc: (method: string, params?: unknown, timeoutMs?: number) => Promise<{ resultJson: string; isError: boolean; beaconHash: string }>;
-  cosignAndSubmit: (destHashHex: string, partialTxB64: string, timeoutMs?: number) => Promise<string>;
+  cosignAndSubmit: (partialTxB64: string, timeoutMs?: number) => Promise<{ txSig: string; beaconHash: string }>;
   // Payment / program ID
   setProgramId: (programIdHex: string) => boolean;
   getProgramId: () => string | null;

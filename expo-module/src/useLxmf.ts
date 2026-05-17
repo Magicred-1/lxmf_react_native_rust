@@ -502,17 +502,16 @@ export function useLxmf(options: UseLxmfOptions = {}) {
    * Returns the Solana transaction signature string.
    */
   const cosignAndSubmit = useCallback(async (
-    destHashHex: string,
     partialTxB64: string,
     timeoutMs = 60_000,
-  ): Promise<string> => {
-    const { resultJson, isError } = await beaconRpcWait(
-      destHashHex, 'cosignTransaction', [partialTxB64], timeoutMs
+  ): Promise<{ txSig: string; beaconHash: string }> => {
+    const { resultJson, isError, beaconHash } = await beaconBroadcastRpc(
+      'cosignTransaction', [partialTxB64], timeoutMs
     );
     const parsed = JSON.parse(resultJson);
     if (isError) throw new Error(parsed?.message ?? 'cosignAndSubmit failed');
-    return parsed?.result ?? '';
-  }, [beaconRpcWait]);
+    return { txSig: parsed?.result ?? '', beaconHash };
+  }, [beaconBroadcastRpc]);
 
   const setProgramId = useCallback((programIdHex: string): boolean => {
     try { return LxmfModule.setProgramId(programIdHex); }
