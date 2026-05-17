@@ -505,13 +505,20 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     partialTxB64: string,
     timeoutMs = 60_000,
   ): Promise<{ txSig: string; beaconHash: string }> => {
-    const { resultJson, isError, beaconHash } = await beaconBroadcastRpc(
-      'cosignTransaction', [partialTxB64], timeoutMs
+    const raw = LxmfModule.getBeacons();
+    const list: Array<{ destHash: string }> = raw ? JSON.parse(raw) : [];
+    if (list.length === 0) throw new Error('No beacons discovered yet');
+    return Promise.any(
+      list.map(b =>
+        beaconRpcWait(b.destHash, 'cosignTransaction', [partialTxB64], timeoutMs)
+          .then(res => {
+            const parsed = JSON.parse(res.resultJson);
+            if (res.isError) throw new Error(parsed?.message ?? 'cosign rejected');
+            return { txSig: parsed?.result ?? '', beaconHash: b.destHash };
+          })
+      )
     );
-    const parsed = JSON.parse(resultJson);
-    if (isError) throw new Error(parsed?.message ?? 'cosignAndSubmit failed');
-    return { txSig: parsed?.result ?? '', beaconHash };
-  }, [beaconBroadcastRpc]);
+  }, [beaconRpcWait]);
 
   const setProgramId = useCallback((programIdHex: string): boolean => {
     try { return LxmfModule.setProgramId(programIdHex); }
