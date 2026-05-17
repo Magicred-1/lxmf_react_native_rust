@@ -552,4 +552,111 @@ mod tests {
         assert_eq!(v["id"], 7);
         assert_eq!(v["error"]["code"], -32000);
     }
+
+    // ── extract_account_key ───────────────────────────────────────────────────
+
+    #[test]
+    fn extract_account_key_returns_first_key() {
+        // make_message_with_discriminator: header [2,0,1], count [3], 3×32B keys all zeros
+        let disc = crate::solana_tx::anchor_discriminator("execute_payment");
+        let msg = make_message_with_discriminator(disc);
+        // All three account keys are [0u8; 32] — verify index 0 and 2 return them
+        assert_eq!(extract_account_key(&msg, 0), Some([0u8; 32]));
+        assert_eq!(extract_account_key(&msg, 2), Some([0u8; 32]));
+    }
+
+    #[test]
+    fn extract_account_key_out_of_bounds_returns_none() {
+        let disc = [0u8; 8];
+        let msg = make_message_with_discriminator(disc); // 3 accounts
+        assert_eq!(extract_account_key(&msg, 3), None); // index == count
+        assert_eq!(extract_account_key(&msg, 99), None);
+    }
+
+    #[test]
+    fn extract_account_key_returns_none_on_truncated_message() {
+        assert_eq!(extract_account_key(&[], 0), None);
+        assert_eq!(extract_account_key(&[0u8; 2], 0), None); // less than 3-byte header
+    }
+
+    // ── payer-sig gate (unit tests the verify_slot_signature logic that
+    //    cosign_and_submit calls before co-signing) ──────────────────────────
+
+    fn make_plain_tx_bytes() -> (Vec<u8>, ed25519_dalek::SigningKey) {
+        use crate::solana_tx::*;
+        let seed = [77u8; 32];
+        let keypair = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let payer = keypair.verifying_key().to_bytes();
+        let accounts = PlainExecutePaymentAccounts {
+            payer,
+            payer_ata:      [3u8; 32],
+            recipient:      [4u8; 32],
+            recipient_ata:  [5u8; 32],
+            broadcaster_ata:[6u8; 32],
+            mint:           [7u8; 32],
+            program_id:     [8u8; 32],
+        };
+        let params = ExecutePaymentParams {
+            comp_offset: 0, amount: 500_000,
+            encrypted_amount: [0u8; 32], nonce: 1,
+            encryption_pub_key: [0u8; 32],
+        };
+        let tx = build_unsigned_execute_payment(&payer, &[2u8; 32], [0u8; 32], &accounts, &params);
+        (tx, keypair)
+    }
+
+    #[test]
+    fn cosign_gate_rejects_unsigned_payer_slot() {
+        use crate::solana_tx::verify_slot_signature;
+        let (tx, keypair) = make_plain_tx_bytes();
+        let payer_pubkey = keypair.verifying_key().to_bytes();
+        // slot 0 is all zeros → must fail (this is what cosign_and_submit checks)
+        assert!(!verify_slot_signature(&tx, &payer_pubkey, 0));
+    }
+
+    #[test]
+    fn cosign_gate_accepts_signed_payer_slot() {
+        use crate::solana_tx::{sign_tx_at_slot, verify_slot_signature};
+        let (tx, keypair) = make_plain_tx_bytes();
+        let payer_pubkey = keypair.verifying_key().to_bytes();
+        let signed = sign_tx_at_slot(&tx, &keypair, 0);
+        // now slot 0 carries a real sig
+        assert!(verify_slot_signature(&signed, &payer_pubkey, 0));
+        // slot 1 is still zeros → still fails
+        let broadcaster = [2u8; 32];
+        assert!(!verify_slot_signature(&signed, &broadcaster, 1));
+    }
+
+    #[test]
+    fn extract_account_key_matches_payer_in_plain_tx() {
+        use crate::solana_tx::*;
+        let seed = [77u8; 32];
+        let keypair = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let payer = keypair.verifying_key().to_bytes();
+        let broadcaster = [2u8; 32];
+        let accounts = PlainExecutePaymentAccounts {
+            payer,
+            payer_ata:      [3u8; 32],
+            recipient:      [4u8; 32],
+            recipient_ata:  [5u8; 32],
+            broadcaster_ata:[6u8; 32],
+            mint:           [7u8; 32],
+            program_id:     [8u8; 32],
+        };
+        let params = ExecutePaymentParams {
+            comp_offset: 0, amount: 0,
+            encrypted_amount: [0u8; 32], nonce: 0,
+            encryption_pub_key: [0u8; 32],
+        };
+        let tx = build_unsigned_execute_payment(&payer, &broadcaster, [0u8; 32], &accounts, &params);
+
+        // message starts at byte 1 + 2*64 = 129 (compact_u16(2) + 2 zero sigs)
+        let msg = &tx[129..];
+        // account[0] should be the payer pubkey
+        let extracted = extract_account_key(msg, 0).unwrap();
+        assert_eq!(extracted, payer);
+        // account[1] should be the broadcaster pubkey
+        let extracted_broadcaster = extract_account_key(msg, 1).unwrap();
+        assert_eq!(extracted_broadcaster, broadcaster);
+    }
 }

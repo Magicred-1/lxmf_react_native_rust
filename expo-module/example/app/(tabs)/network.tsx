@@ -44,6 +44,7 @@ export default function NetworkScreen() {
     start, stop, getStatus,
     setBeaconKeypair, setBeaconSolanaRpc, setProgramId,
     beacons, beaconRpcWait, beaconBroadcastRpc,
+    requestUnsignedTx, submitSignedTx, cosignAndSubmit,
   } = useLxmfContext();
 
   const [tab, setTab] = useState<TransportTab>('both');
@@ -60,6 +61,28 @@ export default function NetworkScreen() {
   const [selectedBeacon, setSelectedBeacon] = useState<string | null>(null);
   const [rpcLoading, setRpcLoading] = useState(false);
   const [rpcResult, setRpcResult] = useState<string | null>(null);
+
+  // Payment demo state
+  const [payerKeyHex, setPayerKeyHex] = useState('');
+  const [accountsJson, setAccountsJson] = useState(JSON.stringify({
+    payer:          '0'.repeat(64),
+    payerAta:       '0'.repeat(64),
+    recipient:      '0'.repeat(64),
+    recipientAta:   '0'.repeat(64),
+    broadcasterAta: '0'.repeat(64),
+    mint:           '0'.repeat(64),
+  }, null, 2));
+  const [paramsJson, setParamsJson] = useState(JSON.stringify({
+    compOffset:       0,
+    amount:           1_000_000,
+    encryptedAmount:  '0'.repeat(64),
+    nonce:            '0',
+    encryptionPubKey: '0'.repeat(64),
+  }, null, 2));
+  const [preparedTxB64, setPreparedTxB64] = useState<string | null>(null);
+  const [preparedBeaconHash, setPreparedBeaconHash] = useState<string | null>(null);
+  const [paymentLoading, setPaymentLoading] = useState(false);
+  const [paymentResult, setPaymentResult] = useState<string | null>(null);
 
   // Poll BLE peer count while running
   useEffect(() => {
@@ -366,6 +389,129 @@ export default function NetworkScreen() {
           )}
         </View>
       )}
+
+      {/* ── Payment cosign demo ──────────────────────────────────────── */}
+      {isRunning && beacons.length > 0 && (
+        <View style={S.card}>
+          <Text style={S.cardTitle}>Payment (Cosign Demo)</Text>
+          <Text style={S.emptyHint}>
+            Non-MWA path — private key never leaves device. For MWA use Prepare → wallet sign → Submit.
+          </Text>
+
+          <TextInput
+            style={S.input}
+            placeholder="Payer private key (64 hex chars)"
+            placeholderTextColor="#4a6070"
+            value={payerKeyHex}
+            onChangeText={setPayerKeyHex}
+            autoCapitalize="none"
+            autoCorrect={false}
+            secureTextEntry
+          />
+
+          <Text style={S.fieldLabel}>Accounts JSON</Text>
+          <TextInput
+            style={[S.input, S.textArea]}
+            placeholder="{ payer, payerAta, recipient, recipientAta, broadcasterAta, mint }"
+            placeholderTextColor="#4a6070"
+            value={accountsJson}
+            onChangeText={setAccountsJson}
+            autoCapitalize="none"
+            autoCorrect={false}
+            multiline
+          />
+
+          <Text style={S.fieldLabel}>Params JSON</Text>
+          <TextInput
+            style={[S.input, S.textArea]}
+            placeholder="{ compOffset, amount, encryptedAmount, nonce, encryptionPubKey }"
+            placeholderTextColor="#4a6070"
+            value={paramsJson}
+            onChangeText={setParamsJson}
+            autoCapitalize="none"
+            autoCorrect={false}
+            multiline
+          />
+
+          <View style={S.btnRow}>
+            {/* Round 1 only — useful for MWA: get the unsigned tx, sign externally */}
+            <Pressable
+              style={({ pressed }) => [S.btn, paymentLoading && S.btnDisabled, pressed && S.btnPressed]}
+              disabled={paymentLoading}
+              onPress={async () => {
+                setPaymentLoading(true);
+                setPaymentResult(null);
+                setPreparedTxB64(null);
+                setPreparedBeaconHash(null);
+                try {
+                  const accounts = JSON.parse(accountsJson);
+                  const params   = JSON.parse(paramsJson);
+                  const { unsignedTxB64, beaconHash } = await requestUnsignedTx(accounts, params);
+                  setPreparedTxB64(unsignedTxB64);
+                  setPreparedBeaconHash(beaconHash);
+                  setPaymentResult(`prepared\nbeacon: ${shortHex(beaconHash)}\ntxB64: ${unsignedTxB64.slice(0, 40)}…`);
+                } catch (e: any) {
+                  setPaymentResult(`error: ${e?.message ?? String(e)}`);
+                } finally {
+                  setPaymentLoading(false);
+                }
+              }}>
+              <Text style={S.btnText}>{paymentLoading ? '…' : 'Prepare'}</Text>
+            </Pressable>
+
+            {/* Submit round 2 with an already-prepared tx (MWA: sign externally first) */}
+            <Pressable
+              style={({ pressed }) => [S.btn, (!preparedTxB64 || !preparedBeaconHash || paymentLoading) && S.btnDisabled, pressed && S.btnPressed]}
+              disabled={!preparedTxB64 || !preparedBeaconHash || paymentLoading}
+              onPress={async () => {
+                if (!preparedTxB64 || !preparedBeaconHash) return;
+                setPaymentLoading(true);
+                setPaymentResult(null);
+                try {
+                  const signed = await submitSignedTx(preparedBeaconHash, preparedTxB64);
+                  setPaymentResult(`submitted\ntxSig: ${shortHex(signed.txSig)}\nbeacon: ${shortHex(signed.beaconHash)}`);
+                  setPreparedTxB64(null);
+                  setPreparedBeaconHash(null);
+                } catch (e: any) {
+                  setPaymentResult(`error: ${e?.message ?? String(e)}`);
+                } finally {
+                  setPaymentLoading(false);
+                }
+              }}>
+              <Text style={S.btnText}>{paymentLoading ? '…' : 'Submit'}</Text>
+            </Pressable>
+          </View>
+
+          {/* One-shot non-MWA: prepare + local sign + submit in one call */}
+          <Pressable
+            style={({ pressed }) => [S.btn, (payerKeyHex.length !== 64 || paymentLoading) && S.btnDisabled, pressed && S.btnPressed]}
+            disabled={payerKeyHex.length !== 64 || paymentLoading}
+            onPress={async () => {
+              setPaymentLoading(true);
+              setPaymentResult(null);
+              setPreparedTxB64(null);
+              setPreparedBeaconHash(null);
+              try {
+                const accounts = JSON.parse(accountsJson);
+                const params   = JSON.parse(paramsJson);
+                const { txSig, beaconHash } = await cosignAndSubmit(payerKeyHex, accounts, params);
+                setPaymentResult(`confirmed\ntxSig: ${shortHex(txSig)}\nbeacon: ${shortHex(beaconHash)}`);
+              } catch (e: any) {
+                setPaymentResult(`error: ${e?.message ?? String(e)}`);
+              } finally {
+                setPaymentLoading(false);
+              }
+            }}>
+            <Text style={S.btnText}>{paymentLoading ? '…' : 'Sign & Submit (direct key)'}</Text>
+          </Pressable>
+
+          {paymentResult !== null && (
+            <ScrollView style={S.rpcResultBox} nestedScrollEnabled>
+              <Text style={S.rpcResultText}>{paymentResult}</Text>
+            </ScrollView>
+          )}
+        </View>
+      )}
     </ScrollView>
   );
 }
@@ -435,4 +581,7 @@ const S = StyleSheet.create({
 
   rpcResultBox: { maxHeight: 120, backgroundColor: '#080f16', borderRadius: 8, padding: 8, marginTop: 4 },
   rpcResultText: { color: '#7affb2', fontSize: 12, fontFamily: 'monospace' },
+
+  fieldLabel: { color: '#7a9db5', fontSize: 11, marginBottom: -4 },
+  textArea: { minHeight: 80, textAlignVertical: 'top' },
 });
