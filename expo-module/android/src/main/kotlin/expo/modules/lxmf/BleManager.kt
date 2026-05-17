@@ -66,16 +66,27 @@ class BleManager(
     // Buffer for ATT Long Write (preparedWrite=true) fragments from remote centrals.
     private val preparedWriteBuffer: MutableMap<String, java.io.ByteArrayOutputStream> = Collections.synchronizedMap(mutableMapOf())
 
-    // TX polling — every 50 ms drain the Rust TX queue and write to peers
+    private var txEmptyPollCount = 0
+    private var currentTxPollIntervalMs = TX_POLL_INTERVAL_MS
+
+    // TX polling — drain the Rust TX queue and write to peers; backs off when idle
     private val txPollRunnable = object : Runnable {
         override fun run() {
-            drainTxQueue()
-            mainHandler.postDelayed(this, TX_POLL_INTERVAL_MS)
+            val hadFrames = drainTxQueue()
+            if (hadFrames) {
+                txEmptyPollCount = 0
+                currentTxPollIntervalMs = TX_POLL_INTERVAL_MS
+            } else if (++txEmptyPollCount >= TX_BACKOFF_EMPTY_POLLS) {
+                currentTxPollIntervalMs = minOf(currentTxPollIntervalMs * 2, TX_MAX_POLL_INTERVAL_MS)
+            }
+            mainHandler.postDelayed(this, currentTxPollIntervalMs)
         }
     }
 
     companion object {
         private const val TX_POLL_INTERVAL_MS = 50L
+        private const val TX_MAX_POLL_INTERVAL_MS = 500L
+        private const val TX_BACKOFF_EMPTY_POLLS = 5
         private const val SCAN_RESTART_DELAY_MS = 30_000L
         /** How long to wait before reconnecting to a peer that just disconnected. */
         private const val RECONNECT_COOLDOWN_MS = 15_000L
@@ -100,6 +111,8 @@ class BleManager(
         startScanning()
         // Remove any stale callbacks before scheduling — guards against duplicate
         // poll loops if start() is somehow called more than once.
+        txEmptyPollCount = 0
+        currentTxPollIntervalMs = TX_POLL_INTERVAL_MS
         mainHandler.removeCallbacks(txPollRunnable)
         mainHandler.postDelayed(txPollRunnable, TX_POLL_INTERVAL_MS)
         Log.i(TAG, "BleManager started")
@@ -114,6 +127,7 @@ class BleManager(
         connections.values.forEach { it.disconnect(); it.close() }
         connections.clear()
         connecting.clear()
+        disconnectedAt.clear()
         Log.i(TAG, "BleManager stopped")
     }
 
@@ -253,6 +267,7 @@ class BleManager(
                     Log.d(TAG, "GATT server: $mac connected")
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
+                    preparedWriteBuffer.remove(mac)
                     if (serverSubscribers.remove(mac) != null) {
                         Log.i(TAG, "GATT server: $mac disconnected (was subscribed)")
                         module.nativeBleDisconnected(macToBytes(mac))
@@ -528,9 +543,9 @@ class BleManager(
     // Android GATT is single-op: concurrent writeCharacteristic() calls return
     // false and drop the packet. Send one frame per 50ms poll tick instead of
     // draining all pending frames at once.
-    private fun drainTxQueue() {
-        val json = module.nativeBlePollTx() ?: return
-        try {
+    private fun drainTxQueue(): Boolean {
+        val json = module.nativeBlePollTx() ?: return false
+        return try {
             val obj = org.json.JSONObject(json)
             val peerHex = obj.getString("peer")           // "aabbccddeeff"
             val dataB64 = obj.getString("data")
@@ -544,23 +559,25 @@ class BleManager(
             if (subscriber != null && txChar != null) {
                 val ok = notifyServerSubscriber(subscriber, txChar, data)
                 Log.d(TAG, "BLE NOTIFY ${data.size}B to $mac ok=$ok")
-                return
+                return true
             }
 
             // Central (client) role: write to peer's RX characteristic.
             // RX has WRITE properties; TX is notify-only (writes there
             // would be rejected by the peer). Matches iOS convention.
-            val gatt = connections[mac] ?: return
-            val service = gatt.getService(RNS_SERVICE_UUID) ?: return
-            val peerRxChar = service.getCharacteristic(RNS_RX_CHAR_UUID) ?: return
+            val gatt = connections[mac] ?: return false
+            val service = gatt.getService(RNS_SERVICE_UUID) ?: return false
+            val peerRxChar = service.getCharacteristic(RNS_RX_CHAR_UUID) ?: return false
             @Suppress("DEPRECATION")
             peerRxChar.value = data
             peerRxChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
             @Suppress("DEPRECATION")
             val ok = gatt.writeCharacteristic(peerRxChar)
             Log.d(TAG, "BLE TX ${data.size}B to $mac ok=$ok")
+            true
         } catch (e: Exception) {
             Log.e(TAG, "drainTxQueue parse error: ${e.message}")
+            false
         }
     }
 

@@ -38,4 +38,3 @@ rns-core = { package = "reticulum-rs-core", version = "0.2.0", git = "https://gi
 [features]
 default = []
 fernet-aes128 = []
-

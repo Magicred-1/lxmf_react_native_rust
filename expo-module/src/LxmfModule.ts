@@ -38,6 +38,10 @@ export type NativeModuleType = {
   // Beacon RPC — queue a JSON-RPC 2.0 call to a beacon; response arrives as onRpcResponse event.
   beaconRpc(destHashHex: string, method: string, paramsJson?: string | null): Promise<number>;
 
+  // Beacon configuration (beacon server side)
+  setBeaconKeypair(keyHex: string): boolean;
+  setBeaconSolanaRpc(url: string): boolean;
+
   // Configuration
   setLogLevel(level: number): boolean;
   abiVersion(): number;
@@ -88,6 +92,8 @@ const missingNativeShim: NativeModuleType = {
   blePeerCount: () => throwMissingNative(),
   bleUnpairedRNodeCount: () => throwMissingNative(),
   beaconRpc: async () => throwMissingNative(),
+  setBeaconKeypair: () => throwMissingNative(),
+  setBeaconSolanaRpc: () => throwMissingNative(),
   getNusUnpairedRNodes: () => throwMissingNative(),
   pairNusRNode: () => throwMissingNative(),
   createGroup: () => throwMissingNative(),

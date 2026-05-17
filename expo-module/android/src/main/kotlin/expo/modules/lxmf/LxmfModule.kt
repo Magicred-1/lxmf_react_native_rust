@@ -8,15 +8,26 @@ import expo.modules.kotlin.modules.ModuleDefinition
 import org.json.JSONArray
 
 private const val TAG = "LxmfModule"
-private const val POLL_INTERVAL_MS = 16L
+private const val POLL_INTERVAL_MS     = 16L
+private const val MAX_POLL_INTERVAL_MS = 500L
+private const val BACKOFF_EMPTY_POLLS  = 5
 
 class LxmfModule : Module() {
   private val pollHandler = Handler(Looper.getMainLooper())
+  private var emptyPollCount = 0
+  private var currentPollIntervalMs = POLL_INTERVAL_MS
+
   private val pollRunnable = object : Runnable {
     override fun run() {
-      drainAndEmitEvents()
+      val hadEvents = drainAndEmitEvents()
       nusManager?.pollTxAndWrite()
-      pollHandler.postDelayed(this, POLL_INTERVAL_MS)
+      if (hadEvents) {
+        emptyPollCount = 0
+        currentPollIntervalMs = POLL_INTERVAL_MS
+      } else if (++emptyPollCount >= BACKOFF_EMPTY_POLLS) {
+        currentPollIntervalMs = minOf(currentPollIntervalMs * 2, MAX_POLL_INTERVAL_MS)
+      }
+      pollHandler.postDelayed(this, currentPollIntervalMs)
     }
   }
 
@@ -176,6 +187,21 @@ class LxmfModule : Module() {
       nusManager?.pairRNode(mac) ?: false
     }
 
+    // --- Beacon configuration ---
+
+    Function("setBeaconKeypair") { keyHex: String ->
+      val bytes = try {
+        keyHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+      } catch (e: Exception) { return@Function false }
+      val result = nativeSetBeaconKeypair(bytes) == 0
+      bytes.fill(0)
+      result
+    }
+
+    Function("setBeaconSolanaRpc") { url: String ->
+      nativeSetBeaconSolanaRpc(url) == 0
+    }
+
     // --- Group Chat ---
 
     Function("createGroup") { name: String, keyHex: String ->
@@ -197,18 +223,18 @@ class LxmfModule : Module() {
     }
   }
 
-  private fun drainAndEmitEvents() {
-    if (!isNativeLibraryLoaded()) return
+  private fun drainAndEmitEvents(): Boolean {
+    if (!isNativeLibraryLoaded()) return false
 
     val json = try {
       nativePollEvents()
     } catch (e: UnsatisfiedLinkError) {
       Log.e(TAG, "nativePollEvents unavailable: ${e.message}")
       pollHandler.removeCallbacks(pollRunnable)
-      return
-    } ?: return
+      return false
+    } ?: return false
 
-    try {
+    return try {
       val arr = JSONArray(json)
       for (i in 0 until arr.length()) {
         val obj = arr.getJSONObject(i)
@@ -237,8 +263,10 @@ class LxmfModule : Module() {
         }
         sendEvent(eventName, params)
       }
+      arr.length() > 0
     } catch (e: Exception) {
       Log.e(TAG, "drainAndEmitEvents parse error: ${e.message}")
+      false
     }
   }
 
@@ -266,6 +294,8 @@ class LxmfModule : Module() {
   private external fun nativeBeaconRpc(destHashHex: String, method: String, paramsJson: String?): Long
   private external fun nativeSetLogLevel(level: Int): Int
   private external fun nativeAbiVersion(): Int
+  private external fun nativeSetBeaconKeypair(keyBytes: ByteArray): Int
+  private external fun nativeSetBeaconSolanaRpc(url: String): Int
   private external fun nativeCreateGroup(name: String, keyHex: String): String?
   private external fun nativeJoinGroup(addrHex: String, keyHex: String): Int
   private external fun nativeLeaveGroup(addrHex: String): Int

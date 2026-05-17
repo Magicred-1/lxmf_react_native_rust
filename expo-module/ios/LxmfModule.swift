@@ -143,6 +143,17 @@ func lxmf_beacon_rpc(
     _ paramsJson: UnsafePointer<CChar>?
 ) -> Int64
 
+@_silgen_name("lxmf_beacon_set_keypair")
+func lxmf_beacon_set_keypair(
+    _ keyBytes: UnsafePointer<UInt8>?,
+    _ len: Int32
+) -> Int32
+
+@_silgen_name("lxmf_beacon_set_solana_rpc_url")
+func lxmf_beacon_set_solana_rpc_url(
+    _ url: UnsafePointer<CChar>?
+) -> Int32
+
 @_silgen_name("lxmf_create_group")
 func lxmf_create_group(
     _ name: UnsafePointer<CChar>?,
@@ -173,9 +184,12 @@ public class LxmfModule: Module {
     // Shared JSON buffer for FFI calls (64KB)
     private var jsonBuf = [UInt8](repeating: 0, count: 65536)
 
-    // Poll timers
-    private var rxPollTimer: Timer?
-    private var txDrainTimer: Timer?
+    // Adaptive poll state
+    private var isPolling = false
+    private var emptyRxCount = 0
+    private var currentRxInterval: TimeInterval = 0.016
+    private var emptyTxCount = 0
+    private var currentTxInterval: TimeInterval = 0.02
 
     // BLE manager for phone-to-phone mesh
     private lazy var bleManager: BLEManager = {
@@ -407,6 +421,32 @@ public class LxmfModule: Module {
             return self.bleManager.connectRNode(identifier)
         }
 
+        // --- Beacon configuration ---
+
+        Function("setBeaconKeypair") { (keyHex: String) -> Bool in
+            guard keyHex.count == 64 || keyHex.count == 128 else { return false }
+            var bytes = [UInt8]()
+            var idx = keyHex.startIndex
+            while idx < keyHex.endIndex {
+                let next = keyHex.index(idx, offsetBy: 2)
+                guard let byte = UInt8(keyHex[idx..<next], radix: 16) else {
+                    for i in 0..<bytes.count { bytes[i] = 0 }
+                    return false
+                }
+                bytes.append(byte)
+                idx = next
+            }
+            let ok = bytes.withUnsafeBufferPointer { ptr in
+                lxmf_beacon_set_keypair(ptr.baseAddress, Int32(bytes.count)) == 0
+            }
+            for i in 0..<bytes.count { bytes[i] = 0 }
+            return ok
+        }
+
+        Function("setBeaconSolanaRpc") { (url: String) -> Bool in
+            return url.withCString { lxmf_beacon_set_solana_rpc_url($0) == 0 }
+        }
+
         // --- Group Chat ---
 
         Function("createGroup") { (name: String, keyHex: String) -> String in
@@ -457,41 +497,64 @@ public class LxmfModule: Module {
     // MARK: - Polling
 
     private func startPolling() {
-        // Must schedule on main thread — AsyncFunction runs on a background
-        // dispatch queue whose RunLoop is not active, so timers would never fire.
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-
-            // RX event poll: 80ms interval
-            self.rxPollTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
-                self?.drainEvents()
-            }
-
-            // TX drain for BLE outgoing: 20ms interval
-            self.txDrainTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [weak self] _ in
-                self?.drainOutgoing()
-            }
+            self.isPolling = true
+            self.emptyRxCount = 0
+            self.currentRxInterval = 0.016
+            self.emptyTxCount = 0
+            self.currentTxInterval = 0.02
+            self.scheduleRxPoll()
+            self.scheduleTxDrain()
         }
     }
 
     private func stopPolling() {
-        DispatchQueue.main.async { [weak self] in
-            self?.rxPollTimer?.invalidate()
-            self?.rxPollTimer = nil
-            self?.txDrainTimer?.invalidate()
-            self?.txDrainTimer = nil
+        isPolling = false
+    }
+
+    private func scheduleRxPoll() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + currentRxInterval) { [weak self] in
+            guard let self = self, self.isPolling else { return }
+            let hadEvents = self.drainEvents()
+            if hadEvents {
+                self.emptyRxCount = 0
+                self.currentRxInterval = 0.016
+            } else if self.emptyRxCount >= 5 {
+                self.currentRxInterval = min(self.currentRxInterval * 2, 0.5)
+            } else {
+                self.emptyRxCount += 1
+            }
+            self.scheduleRxPoll()
         }
     }
 
-    private func drainEvents() {
+    private func scheduleTxDrain() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + currentTxInterval) { [weak self] in
+            guard let self = self, self.isPolling else { return }
+            let hadFrames = self.drainOutgoing()
+            if hadFrames {
+                self.emptyTxCount = 0
+                self.currentTxInterval = 0.02
+            } else if self.emptyTxCount >= 5 {
+                self.currentTxInterval = min(self.currentTxInterval * 2, 0.5)
+            } else {
+                self.emptyTxCount += 1
+            }
+            self.scheduleTxDrain()
+        }
+    }
+
+    @discardableResult
+    private func drainEvents() -> Bool {
         let len = jsonBuf.withUnsafeMutableBufferPointer { buf in
             lxmf_poll_events(0, buf.baseAddress, buf.count)
         }
 
-        guard len > 0 else { return }
+        guard len > 0 else { return false }
 
         let jsonData = Data(jsonBuf[0..<Int(len)])
-        guard let events = try? JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]] else { return }
+        guard let events = try? JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]] else { return false }
 
         for event in events {
             guard let type_ = event["type"] as? String else { continue }
@@ -525,9 +588,13 @@ public class LxmfModule: Module {
                 break
             }
         }
+        return !events.isEmpty
     }
 
-    private func drainOutgoing() {
+    @discardableResult
+    private func drainOutgoing() -> Bool {
+        var sentAny = false
+
         // --- Mesh BLE: poll for peer-addressed frames ---
         var peerAddr = [UInt8](repeating: 0, count: 6)
         var dataBuf = [UInt8](repeating: 0, count: 512)
@@ -542,6 +609,7 @@ public class LxmfModule: Module {
 
             let frameData = Data(dataBuf[0..<Int(len)])
             let addr = Data(peerAddr)
+            sentAny = true
             // Stop draining if CoreBluetooth buffer is full — onReadyToSend re-triggers us.
             guard bleManager.sendToPeerAddr(addr, data: frameData) else { break }
         }
@@ -556,7 +624,10 @@ public class LxmfModule: Module {
 
             let kissData = Data(nusBuf[0..<Int(len)])
             bleManager.sendToNus(kissData)
+            sentAny = true
         }
+
+        return sentAny
     }
 
     // MARK: - Helpers

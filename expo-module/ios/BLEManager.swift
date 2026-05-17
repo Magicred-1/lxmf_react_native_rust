@@ -56,6 +56,7 @@ class BLEManager: NSObject {
     // RNode peripherals discovered during scan but not yet paired via iOS Settings.
     // Exposed to the UI so it can prompt the user to pair in Settings first.
     private(set) var discoveredUnpairedRNodes: [UUID: CBPeripheral] = [:]
+    private var rNodeLastSeen: [UUID: Date] = [:]
 
     private var isRunning = false
 
@@ -141,9 +142,11 @@ class BLEManager: NSObject {
 
         centralManager?.stopScan()
         for (_, peripheral) in connectedPeripherals {
+            peripheral.delegate = nil
             centralManager?.cancelPeripheralConnection(peripheral)
         }
         for (_, peripheral) in nusPeripherals {
+            peripheral.delegate = nil
             centralManager?.cancelPeripheralConnection(peripheral)
         }
         connectedPeripherals.removeAll()
@@ -153,6 +156,7 @@ class BLEManager: NSObject {
         nusPeripherals.removeAll()
         nusTxChars.removeAll()
         discoveredUnpairedRNodes.removeAll()
+        rNodeLastSeen.removeAll()
         // Don't clear bondedPeripherals — they persist across sessions
 
         peripheralManager?.stopAdvertising()
@@ -358,8 +362,14 @@ extension BLEManager: CBCentralManagerDelegate {
         let isNus = advertisedServices.contains(BLEManager.nusServiceUUID)
 
         if isNus && !bondedPeripherals.contains(peripheral.identifier) {
-            // Track as discovered-but-unpaired so UI can prompt user
+            // Evict RNodes not seen for 10 minutes before adding new entry
+            let cutoff = Date().addingTimeInterval(-600)
+            for (uuid, seen) in rNodeLastSeen where seen < cutoff {
+                discoveredUnpairedRNodes.removeValue(forKey: uuid)
+                rNodeLastSeen.removeValue(forKey: uuid)
+            }
             discoveredUnpairedRNodes[peripheral.identifier] = peripheral
+            rNodeLastSeen[peripheral.identifier] = Date()
             return
         }
 
@@ -390,6 +400,7 @@ extension BLEManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         let isNus = nusPeripherals[peripheral.identifier] != nil
 
+        peripheral.delegate = nil
         // Always remove from connectedPeripherals (used by both mesh and NUS)
         connectedPeripherals.removeValue(forKey: peripheral.identifier)
 

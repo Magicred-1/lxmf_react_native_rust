@@ -10,8 +10,12 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
 import { LxmfModule, LxmfNodeMode } from '@magicred-1/react-native-lxmf';
 import { useLxmfContext } from '@/context/LxmfContext';
+
+const BEACON_KEYPAIR_KEY = 'lxmf_beacon_keypair_hex';
+const BEACON_RPC_KEY     = 'lxmf_beacon_rpc_url';
 
 function shortHex(v: string): string {
   if (!v || v.length <= 12) return v || '—';
@@ -34,13 +38,15 @@ function Row({ label, value }: Readonly<{ label: string; value: string }>) {
 // ── Main screen ───────────────────────────────────────────────────────────────
 
 export default function NetworkScreen() {
-  const { isRunning, isNativeAvailable, status, error, identityHydrated, displayName, start, stop, getStatus } = useLxmfContext();
+  const { isRunning, isNativeAvailable, status, error, identityHydrated, displayName, start, stop, getStatus, setBeaconKeypair, setBeaconSolanaRpc } = useLxmfContext();
 
   const [tab, setTab] = useState<TransportTab>('both');
   const [tcpHost, setTcpHost] = useState('192.168.1.135');
   const [tcpPort, setTcpPort] = useState('4243');
   const [localName, setLocalName] = useState(displayName);
   const [isBeacon, setIsBeacon] = useState(false);
+  const [beaconKeyHex, setBeaconKeyHex] = useState('');
+  const [beaconRpcUrl, setBeaconRpcUrl] = useState('https://api.devnet.solana.com');
   const [msg, setMsg] = useState('');
   const [bleCount, setBleCount] = useState(0);
   const [unpairedCount, setUnpairedCount] = useState(0);
@@ -64,6 +70,24 @@ export default function NetworkScreen() {
     return () => clearInterval(id);
   }, [isRunning, getStatus]);
 
+  // Load persisted beacon config on mount
+  useEffect(() => {
+    SecureStore.getItemAsync(BEACON_KEYPAIR_KEY).then(v => { if (v) setBeaconKeyHex(v); }).catch(() => {});
+    SecureStore.getItemAsync(BEACON_RPC_KEY).then(v => { if (v) setBeaconRpcUrl(v); }).catch(() => {});
+  }, []);
+
+  // Persist beacon keypair when it changes (only in beacon mode)
+  useEffect(() => {
+    if (!isBeacon || !beaconKeyHex) return;
+    SecureStore.setItemAsync(BEACON_KEYPAIR_KEY, beaconKeyHex).catch(() => {});
+  }, [beaconKeyHex, isBeacon]);
+
+  // Persist beacon RPC URL when it changes (only in beacon mode)
+  useEffect(() => {
+    if (!isBeacon) return;
+    SecureStore.setItemAsync(BEACON_RPC_KEY, beaconRpcUrl).catch(() => {});
+  }, [beaconRpcUrl, isBeacon]);
+
   const requestBlePerms = async (): Promise<boolean> => {
     if (Platform.OS !== 'android') return true;
     const perms = Platform.Version >= 31
@@ -81,6 +105,12 @@ export default function NetworkScreen() {
     setMsg('');
     const name = localName.trim() || 'lxmf-mobile';
 
+    if (isBeacon) {
+      if (beaconKeyHex.length !== 64) { setMsg('Beacon keypair must be 64 hex chars (32-byte seed).'); return; }
+      setBeaconKeypair(beaconKeyHex);
+      setBeaconSolanaRpc(beaconRpcUrl.trim());
+    }
+
     if (tab === 'ble') {
       if (!await requestBlePerms()) return;
       const ok = await start({ mode: LxmfNodeMode.BleOnly, displayName: name, isBeacon });
@@ -95,7 +125,7 @@ export default function NetworkScreen() {
       const ok = await start({ mode, tcpInterfaces: [{ host, port }], displayName: name, isBeacon });
       if (!ok) setMsg('Failed to start node.');
     }
-  }, [tab, tcpHost, tcpPort, localName, isBeacon, start]);
+  }, [tab, tcpHost, tcpPort, localName, isBeacon, beaconKeyHex, beaconRpcUrl, start, setBeaconKeypair, setBeaconSolanaRpc]);
 
   const onStop = useCallback(async () => {
     await stop();
@@ -157,6 +187,34 @@ export default function NetworkScreen() {
             thumbColor={isBeacon ? '#4fb3e8' : '#4a6070'}
           />
         </View>
+
+        {/* Beacon server config — shown only when beacon mode is on */}
+        {isBeacon && (
+          <>
+            <TextInput
+              style={S.input}
+              placeholder="Beacon keypair (64 hex chars)"
+              placeholderTextColor="#4a6070"
+              value={beaconKeyHex}
+              onChangeText={setBeaconKeyHex}
+              autoCapitalize="none"
+              autoCorrect={false}
+              secureTextEntry
+              editable={!isRunning}
+            />
+            <TextInput
+              style={S.input}
+              placeholder="Solana RPC URL"
+              placeholderTextColor="#4a6070"
+              value={beaconRpcUrl}
+              onChangeText={setBeaconRpcUrl}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="url"
+              editable={!isRunning}
+            />
+          </>
+        )}
 
         {msg ? <Text style={S.warn}>{msg}</Text> : null}
 

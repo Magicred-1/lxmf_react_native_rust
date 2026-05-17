@@ -7,6 +7,8 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
 
+use zeroize::Zeroize;
+
 use log::{error, warn};
 use crate::node::{LxmfNode, DestHash};
 
@@ -218,7 +220,72 @@ pub unsafe extern "C" fn lxmf_beacon_rpc(
         Ok(mut mgr) => mgr.queue_rpc(dest, method_str, params) as i64,
         Err(_) => -1,
     };
+    if rpc_id >= 0 {
+        node.rpc_notify.notify_one();
+    }
     rpc_id
+}
+
+// --- Beacon configuration ---
+
+/// Set the beacon's Solana signing keypair (ed25519).
+/// `key_bytes` must be 32 bytes (seed) or 64 bytes (seed + public key).
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_beacon_set_keypair(key_bytes: *const u8, len: i32) -> i32 {
+    if key_bytes.is_null() || (len != 32 && len != 64) { return -1; }
+    let seed_bytes: &[u8] = std::slice::from_raw_parts(key_bytes, 32);
+    let mut seed: [u8; 32] = match seed_bytes.try_into() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let keypair = ed25519_dalek::SigningKey::from_bytes(&seed);
+    seed.zeroize();
+    let beacon_config = {
+        let guard = match crate::node::LxmfNode::global().lock() {
+            Ok(g) => g,
+            Err(_) => return -1,
+        };
+        match guard.as_ref() {
+            Some(n) => std::sync::Arc::clone(&n.beacon_config),
+            None => return -1,
+        }
+    };
+    let rc = {
+        match beacon_config.lock() {
+            Ok(mut cfg) => { cfg.keypair = Some(keypair); 0i32 }
+            Err(_) => -1i32,
+        }
+    };
+    rc
+}
+
+/// Set the Solana RPC URL the beacon uses for cosign submissions and proxied calls.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_beacon_set_solana_rpc_url(url: *const std::ffi::c_char) -> i32 {
+    if url.is_null() { return -1; }
+    let url_str = match std::ffi::CStr::from_ptr(url).to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => return -1,
+    };
+    let beacon_config = {
+        let guard = match crate::node::LxmfNode::global().lock() {
+            Ok(g) => g,
+            Err(_) => return -1,
+        };
+        match guard.as_ref() {
+            Some(n) => std::sync::Arc::clone(&n.beacon_config),
+            None => return -1,
+        }
+    };
+    let rc = {
+        match beacon_config.lock() {
+            Ok(mut cfg) => { cfg.solana_rpc_url = Some(url_str); 0i32 }
+            Err(_) => -1i32,
+        }
+    };
+    rc
 }
 
 // --- Messages ---

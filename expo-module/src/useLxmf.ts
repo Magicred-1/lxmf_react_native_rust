@@ -417,6 +417,16 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     }
   }, []);
 
+  const setBeaconKeypair = useCallback((keyHex: string): boolean => {
+    try { return LxmfModule.setBeaconKeypair(keyHex); }
+    catch (e: any) { setError(e?.message ?? 'setBeaconKeypair failed'); return false; }
+  }, []);
+
+  const setBeaconSolanaRpc = useCallback((url: string): boolean => {
+    try { return LxmfModule.setBeaconSolanaRpc(url); }
+    catch (e: any) { setError(e?.message ?? 'setBeaconSolanaRpc failed'); return false; }
+  }, []);
+
   /** Create a group channel with a shared AES key. Returns the group address hex. */
   const createGroup = useCallback((name: string, keyHex: string): string => {
     try {
@@ -483,6 +493,8 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     getNusUnpairedRNodes,
     pairNusRNode,
     beaconRpc,
+    setBeaconKeypair,
+    setBeaconSolanaRpc,
     createGroup,
     joinGroup,
     leaveGroup,

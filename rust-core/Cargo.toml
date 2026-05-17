@@ -48,6 +48,12 @@ flate2 = "1"
 # SHA-256 for Anchor instruction discriminators
 sha2 = "0.10"
 
+# HTTP client for beacon → Solana RPC calls (rustls avoids native-tls build complexity on Android/iOS)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Secure zeroing of key material (transitive dep via ed25519-dalek; direct for explicit use)
+zeroize = "1"
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false }
 android_logger = "0.13"

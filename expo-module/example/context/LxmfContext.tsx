@@ -82,6 +82,7 @@ export type LxmfContextValue = {
     mode?: LxmfNodeMode;
     tcpInterfaces?: { host: string; port: number }[];
     displayName?: string;
+    isBeacon?: boolean;
   }) => Promise<boolean>;
   stop: () => Promise<void>;
   getStatus: () => LxmfNodeStatus | null;
@@ -100,6 +101,9 @@ export type LxmfContextValue = {
   contacts: Contact[];
   upsertContact: (address: string, opts?: { name?: string; lastMessage?: string }) => void;
   markRead: (address: string) => void;
+  // Beacon server config
+  setBeaconKeypair: (keyHex: string) => boolean;
+  setBeaconSolanaRpc: (url: string) => boolean;
   // Groups
   groups: Group[];
   createGroup: (name: string) => { addrHex: string; keyHex: string };
@@ -386,6 +390,8 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
     contacts,
     upsertContact,
     markRead,
+    setBeaconKeypair: lxmf.setBeaconKeypair,
+    setBeaconSolanaRpc: lxmf.setBeaconSolanaRpc,
     groups,
     createGroup,
     joinGroup,
@@ -395,6 +401,7 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
   }), [
     lxmf.isNativeAvailable, lxmf.isRunning, lxmf.status, lxmf.error, lxmf.events,
     lxmf.start, lxmf.stop, lxmf.getStatus, lxmf.setLogLevel,
+    lxmf.setBeaconKeypair, lxmf.setBeaconSolanaRpc,
     send, fetchMessages, identity, identityHydrated, clearIdentity,
     displayName, setDisplayName, contacts, upsertContact, markRead,
     groups, createGroup, joinGroup, leaveGroup, isGroup, shareGroupInvite,

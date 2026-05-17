@@ -458,6 +458,44 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeBeaconRpc(
     rpc_id
 }
 
+// --- Beacon configuration ---
+
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeSetBeaconKeypair(
+    mut env: JNIEnv,
+    _class: JClass,
+    key_bytes: JByteArray,
+) -> jint {
+    use zeroize::Zeroize;
+    let mut bytes = match jbytes_to_vec(&mut env, &key_bytes) {
+        Ok(b) => b,
+        Err(_) => return -1,
+    };
+    if bytes.len() != 32 && bytes.len() != 64 { bytes.zeroize(); return -1; }
+    let result = unsafe {
+        crate::ffi::lxmf_beacon_set_keypair(bytes.as_ptr() as *const u8, bytes.len() as i32)
+    };
+    bytes.zeroize();
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeSetBeaconSolanaRpc(
+    mut env: JNIEnv,
+    _class: JClass,
+    url: JString,
+) -> jint {
+    let url_str: String = match env.get_string(&url) {
+        Ok(s) => s.into(),
+        Err(_) => return -1,
+    };
+    let c_str = match std::ffi::CString::new(url_str) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    unsafe { crate::ffi::lxmf_beacon_set_solana_rpc_url(c_str.as_ptr()) }
+}
+
 // --- Config ---
 
 #[no_mangle]
