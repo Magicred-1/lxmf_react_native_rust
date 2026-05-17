@@ -160,6 +160,14 @@ func lxmf_extract_nonce_blockhash(
     _ outCap: Int32
 ) -> Int32
 
+@_silgen_name("lxmf_sign_tx")
+func lxmf_sign_tx(
+    _ payerKey: UnsafePointer<UInt8>?,
+    _ txB64: UnsafePointer<CChar>?,
+    _ outBuf: UnsafeMutablePointer<UInt8>?,
+    _ outCap: Int
+) -> Int32
+
 @_silgen_name("lxmf_set_program_id")
 func lxmf_set_program_id(_ programIdHex: UnsafePointer<CChar>?) -> Int32
 
@@ -504,6 +512,32 @@ public class LxmfModule: Module {
             }
             guard written == 64 else { return nil }
             return String(bytes: outBuf, encoding: .utf8)
+        }
+
+        Function("signTx") { (payerKeyHex: String, txB64: String) -> String? in
+            guard payerKeyHex.count == 64 else { return nil }
+            var payerKey = [UInt8]()
+            var idx = payerKeyHex.startIndex
+            while idx < payerKeyHex.endIndex {
+                let next = payerKeyHex.index(idx, offsetBy: 2)
+                guard let byte = UInt8(payerKeyHex[idx..<next], radix: 16) else {
+                    for i in 0..<payerKey.count { payerKey[i] = 0 }
+                    return nil
+                }
+                payerKey.append(byte)
+                idx = next
+            }
+            var outBuf = [UInt8](repeating: 0, count: 2048)
+            let written = payerKey.withUnsafeBufferPointer { pkPtr in
+                txB64.withCString { b64Ptr in
+                    outBuf.withUnsafeMutableBufferPointer { outPtr in
+                        lxmf_sign_tx(pkPtr.baseAddress, b64Ptr, outPtr.baseAddress, outBuf.count)
+                    }
+                }
+            }
+            for i in 0..<payerKey.count { payerKey[i] = 0 }
+            guard written > 0 else { return nil }
+            return String(bytes: outBuf[0..<Int(written)], encoding: .utf8)
         }
 
         // --- Beacon configuration ---

@@ -35,14 +35,12 @@ export interface LxmfMessageEvent {
 
 export interface ExecutePaymentAccounts {
   payer: string;           // 64-char hex (32-byte pubkey)
-  broadcaster: string;
-  nonceAccount: string;
   payerAta: string;
   recipient: string;
   recipientAta: string;
   broadcasterAta: string;
   mint: string;
-  // programId is set once via setProgramId() — not a per-call argument
+  // broadcaster and programId are beacon-side — not per-call arguments
 }
 
 /** Well-known Solana program addresses as 64-char lowercase hex (no base58). */
@@ -479,46 +477,88 @@ export function useLxmf(options: UseLxmfOptions = {}) {
 
   /**
    * Send the same RPC call to ALL discovered beacons simultaneously.
-   * Resolves with the first successful response and the responding beacon's destHash.
+   * Resolves with the first *successful* (non-error) response and the responding beacon's destHash.
+   * Error responses are rejected so Promise.any skips them in favour of a succeeding beacon.
    */
   const beaconBroadcastRpc = useCallback(async (
     method: string,
     params?: unknown,
     timeoutMs = 30_000,
-  ): Promise<{ resultJson: string; isError: boolean; beaconHash: string }> => {
+  ): Promise<{ resultJson: string; beaconHash: string }> => {
     const raw = LxmfModule.getBeacons();
     const list: Array<{ destHash: string }> = raw ? JSON.parse(raw) : [];
     if (list.length === 0) throw new Error('No beacons discovered yet');
     return Promise.any(
       list.map(b =>
         beaconRpcWait(b.destHash, method, params, timeoutMs)
-          .then(res => ({ ...res, beaconHash: b.destHash }))
+          .then(res => {
+            if (res.isError) {
+              const parsed = JSON.parse(res.resultJson) as { message?: string };
+              throw new Error(parsed.message ?? 'rpc error');
+            }
+            return { resultJson: res.resultJson, beaconHash: b.destHash };
+          })
       )
     );
   }, [beaconRpcWait]);
 
   /**
-   * Submit a partial transaction to a beacon for co-signing and Solana broadcast.
-   * Returns the Solana transaction signature string.
+   * Round 1 of the 2-step cosign protocol.
+   * Broadcasts `prepareTransaction` to all discovered beacons; races for the first success.
+   * Returns the unsigned tx bytes (base64) and the destHash of the responding beacon.
+   *
+   * MWA path: pass `unsignedTxB64` to your wallet adapter, then call `submitSignedTx`.
    */
-  const cosignAndSubmit = useCallback(async (
+  const requestUnsignedTx = useCallback(async (
+    accounts: ExecutePaymentAccounts,
+    params: ExecutePaymentParams,
+    timeoutMs = 60_000,
+  ): Promise<{ unsignedTxB64: string; beaconHash: string }> => {
+    const { resultJson, beaconHash } = await beaconBroadcastRpc(
+      'prepareTransaction',
+      [JSON.stringify({ accounts, params })],
+      timeoutMs,
+    );
+    const prepared = JSON.parse(resultJson) as { result?: { unsignedTxB64?: string } };
+    const unsignedTxB64 = prepared.result?.unsignedTxB64;
+    if (!unsignedTxB64) throw new Error('prepareTransaction: no unsignedTxB64 in response');
+    return { unsignedTxB64, beaconHash };
+  }, [beaconBroadcastRpc]);
+
+  /**
+   * Round 2 of the 2-step cosign protocol.
+   * Sends the payer-signed tx to the specific beacon that built it.
+   * Beacon verifies payer sig, cosigns slot 1, and submits to Solana.
+   */
+  const submitSignedTx = useCallback(async (
+    beaconHash: string,
     partialTxB64: string,
     timeoutMs = 60_000,
   ): Promise<{ txSig: string; beaconHash: string }> => {
-    const raw = LxmfModule.getBeacons();
-    const list: Array<{ destHash: string }> = raw ? JSON.parse(raw) : [];
-    if (list.length === 0) throw new Error('No beacons discovered yet');
-    return Promise.any(
-      list.map(b =>
-        beaconRpcWait(b.destHash, 'cosignTransaction', [partialTxB64], timeoutMs)
-          .then(res => {
-            const parsed = JSON.parse(res.resultJson);
-            if (res.isError) throw new Error(parsed?.message ?? 'cosign rejected');
-            return { txSig: parsed?.result ?? '', beaconHash: b.destHash };
-          })
-      )
-    );
+    const res = await beaconRpcWait(beaconHash, 'cosignTransaction', [partialTxB64], timeoutMs);
+    const parsed = JSON.parse(res.resultJson) as { result?: string; message?: string };
+    if (res.isError) throw new Error(parsed.message ?? 'cosign rejected');
+    return { txSig: parsed.result ?? '', beaconHash };
   }, [beaconRpcWait]);
+
+  /**
+   * Full 2-step cosign flow for the non-MWA (direct private key) case.
+   * Broadcasts `prepareTransaction`, signs payer slot 0 locally, then calls `cosignTransaction`
+   * on the same beacon. Returns the confirmed Solana tx signature.
+   *
+   * For MWA: use `requestUnsignedTx` + your wallet adapter + `submitSignedTx` instead.
+   */
+  const cosignAndSubmit = useCallback(async (
+    payerPrivKeyHex: string,
+    accounts: ExecutePaymentAccounts,
+    params: ExecutePaymentParams,
+    timeoutMs = 60_000,
+  ): Promise<{ txSig: string; beaconHash: string }> => {
+    const { unsignedTxB64, beaconHash } = await requestUnsignedTx(accounts, params, timeoutMs);
+    const partialTxB64 = LxmfModule.signTx(payerPrivKeyHex, unsignedTxB64);
+    if (!partialTxB64) throw new Error('signTx: local signing failed');
+    return submitSignedTx(beaconHash, partialTxB64, timeoutMs);
+  }, [requestUnsignedTx, submitSignedTx]);
 
   const setProgramId = useCallback((programIdHex: string): boolean => {
     try { return LxmfModule.setProgramId(programIdHex); }
@@ -540,16 +580,15 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     catch (e: any) { setError(e?.message ?? 'setBeaconSolanaRpc failed'); return false; }
   }, []);
 
+  /** @deprecated Use cosignAndSubmit (plain tx) or requestUnsignedTx+submitSignedTx (MWA). */
   const partialSignExecutePayment = useCallback((
     payerKeyHex: string,
     nonceBlockhashHex: string,
-    accounts: ExecutePaymentAccounts,
-    params: ExecutePaymentParams,
+    accountsJson: string,
+    paramsJson: string,
   ): string | null => {
     try {
-      return LxmfModule.partialSignExecutePayment(
-        payerKeyHex, nonceBlockhashHex,
-        JSON.stringify(accounts), JSON.stringify(params));
+      return LxmfModule.partialSignExecutePayment(payerKeyHex, nonceBlockhashHex, accountsJson, paramsJson);
     } catch (e: any) { setError(e?.message ?? 'partialSignExecutePayment failed'); return null; }
   }, []);
 
@@ -626,6 +665,8 @@ export function useLxmf(options: UseLxmfOptions = {}) {
     beaconRpc,
     beaconRpcWait,
     beaconBroadcastRpc,
+    requestUnsignedTx,
+    submitSignedTx,
     cosignAndSubmit,
     setProgramId,
     getProgramId,

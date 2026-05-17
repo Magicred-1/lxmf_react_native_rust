@@ -54,6 +54,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Secure zeroing of key material (transitive dep via ed25519-dalek; direct for explicit use)
 zeroize = "1"
 
+# Base58 for decoding Solana blockhashes from RPC responses
+bs58 = "0.5"
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false }
 android_logger = "0.13"

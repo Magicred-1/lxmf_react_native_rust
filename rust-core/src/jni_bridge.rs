@@ -515,6 +515,42 @@ pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativePartialSignExecutePaym
 }
 
 #[no_mangle]
+pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeSignTx(
+    mut env: JNIEnv,
+    _class: JClass,
+    payer_key: JByteArray,
+    tx_b64: JString,
+) -> jstring {
+    use zeroize::Zeroize;
+    let mut payer_bytes = match jbytes_to_vec(&mut env, &payer_key) {
+        Ok(b) => b, Err(_) => return std::ptr::null_mut(),
+    };
+    if payer_bytes.len() != 32 { payer_bytes.zeroize(); return std::ptr::null_mut(); }
+
+    let b64_str: String = match env.get_string(&tx_b64) {
+        Ok(s) => s.into(), Err(_) => { payer_bytes.zeroize(); return std::ptr::null_mut(); }
+    };
+    let b64_c = match std::ffi::CString::new(b64_str) {
+        Ok(s) => s, Err(_) => { payer_bytes.zeroize(); return std::ptr::null_mut(); }
+    };
+
+    let mut out = [0u8; 2048]; // signed tx is larger than 1024 bytes
+    let written = unsafe {
+        crate::ffi::lxmf_sign_tx(payer_bytes.as_ptr(), b64_c.as_ptr(), out.as_mut_ptr(), out.len())
+    };
+    payer_bytes.zeroize();
+    if written < 0 { return std::ptr::null_mut(); }
+
+    let s = match std::str::from_utf8(&out[..written as usize]) {
+        Ok(s) => s, Err(_) => return std::ptr::null_mut(),
+    };
+    match env.new_string(s) {
+        Ok(js) => js.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn Java_expo_modules_lxmf_LxmfModule_nativeExtractNonceBlockhash(
     mut env: JNIEnv,
     _class: JClass,

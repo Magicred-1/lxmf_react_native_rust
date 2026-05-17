@@ -69,8 +69,9 @@ pub async fn handle_rpc_request(
 
     let id = req.id;
     match req.method.as_str() {
-        "cosignTransaction" => cosign_and_submit(id, &req.params, keypair, solana_rpc_url, program_id).await,
-        method => proxy_solana(id, method, req.params, solana_rpc_url).await,
+        "cosignTransaction"  => cosign_and_submit(id, &req.params, keypair, solana_rpc_url, program_id).await,
+        "prepareTransaction" => prepare_transaction(id, &req.params, keypair, solana_rpc_url, program_id).await,
+        method               => proxy_solana(id, method, req.params, solana_rpc_url).await,
     }
 }
 
@@ -121,6 +122,15 @@ async fn cosign_and_submit(
     // Sign the Solana message bytes (everything after the signature array)
     let message_bytes = tx_bytes[msg_start..].to_vec();
 
+    // Verify payer's slot 0 signature before cosigning — rejects crafted/invalid txs
+    let payer_pubkey = match extract_account_key(&message_bytes, 0) {
+        Some(k) => k,
+        None => return error_response(request_id, -32602, "tx: cannot extract payer pubkey"),
+    };
+    if !crate::solana_tx::verify_slot_signature(&tx_bytes, &payer_pubkey, 0) {
+        return error_response(request_id, -32600, "tx: payer signature (slot 0) is invalid");
+    }
+
     if !verify_execute_payment_instruction(&message_bytes, &program_id) {
         return error_response(request_id, -32602,
             "cosignTransaction: not a valid execute_payment for the configured program");
@@ -151,6 +161,109 @@ async fn cosign_and_submit(
 
     // Relay Solana's result/error back to the client, preserving our request_id
     rewrap_response(request_id, resp_json)
+}
+
+// ── prepareTransaction ────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct PrepareAccountsJson {
+    payer: String,
+    #[serde(rename = "payerAta")]      payer_ata: String,
+    recipient: String,
+    #[serde(rename = "recipientAta")]  recipient_ata: String,
+    #[serde(rename = "broadcasterAta")] broadcaster_ata: String,
+    mint: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PrepareParamsJson {
+    #[serde(rename = "compOffset")]       comp_offset: u64,
+    amount: u64,
+    #[serde(rename = "encryptedAmount")]  encrypted_amount: String,
+    nonce: String,
+    #[serde(rename = "encryptionPubKey")] encryption_pub_key: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PrepareTransactionRequest {
+    accounts: PrepareAccountsJson,
+    params: PrepareParamsJson,
+}
+
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    hex::decode(s).ok()?.try_into().ok()
+}
+
+/// Build an unsigned execute_payment tx and return it base64-encoded.
+/// Beacon fills its own pubkey as `broadcaster`; client signs payer slot 0 before cosigning.
+async fn prepare_transaction(
+    id: u32,
+    params: &serde_json::Value,
+    keypair: &ed25519_dalek::SigningKey,
+    solana_rpc_url: &str,
+    program_id: [u8; 32],
+) -> Vec<u8> {
+    let arg = match params.get(0).and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return error_response(id, -32602, "prepareTransaction: missing params[0]"),
+    };
+    let req: PrepareTransactionRequest = match serde_json::from_str(arg) {
+        Ok(r) => r,
+        Err(e) => return error_response(id, -32602, &format!("prepareTransaction: invalid params: {e}")),
+    };
+
+    let blockhash = match fetch_latest_blockhash(solana_rpc_url).await {
+        Ok(b) => b,
+        Err(e) => return error_response(id, -32603, &format!("getLatestBlockhash failed: {e}")),
+    };
+
+    let broadcaster = keypair.verifying_key().to_bytes(); // public bytes only
+
+    let payer = match hex32(&req.accounts.payer) { Some(b) => b, None => return error_response(id, -32602, "bad payer") };
+    let accounts = crate::solana_tx::PlainExecutePaymentAccounts {
+        payer,
+        payer_ata:      match hex32(&req.accounts.payer_ata)      { Some(b) => b, None => return error_response(id, -32602, "bad payerAta") },
+        recipient:      match hex32(&req.accounts.recipient)      { Some(b) => b, None => return error_response(id, -32602, "bad recipient") },
+        recipient_ata:  match hex32(&req.accounts.recipient_ata)  { Some(b) => b, None => return error_response(id, -32602, "bad recipientAta") },
+        broadcaster_ata:match hex32(&req.accounts.broadcaster_ata){ Some(b) => b, None => return error_response(id, -32602, "bad broadcasterAta") },
+        mint:           match hex32(&req.accounts.mint)           { Some(b) => b, None => return error_response(id, -32602, "bad mint") },
+        program_id,
+    };
+
+    let enc_amt = match hex32(&req.params.encrypted_amount) { Some(b) => b, None => return error_response(id, -32602, "bad encryptedAmount") };
+    let nonce_u128: u128 = match req.params.nonce.parse() { Ok(n) => n, Err(_) => return error_response(id, -32602, "bad nonce") };
+    let ep_params = crate::solana_tx::ExecutePaymentParams {
+        comp_offset: req.params.comp_offset,
+        amount: req.params.amount,
+        encrypted_amount: enc_amt,
+        nonce: nonce_u128,
+        encryption_pub_key: match hex32(&req.params.encryption_pub_key) { Some(b) => b, None => return error_response(id, -32602, "bad encryptionPubKey") },
+    };
+
+    let tx_bytes = crate::solana_tx::build_unsigned_execute_payment(
+        &payer, &broadcaster, blockhash, &accounts, &ep_params,
+    );
+    let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+    let resp = serde_json::json!({
+        "jsonrpc": "2.0", "id": id,
+        "result": { "unsignedTxB64": tx_b64 }
+    });
+    compress_payload(resp.to_string().as_bytes())
+}
+
+async fn fetch_latest_blockhash(solana_rpc_url: &str) -> Result<[u8; 32], String> {
+    let client = build_http_client().map_err(|e| e.to_string())?;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getLatestBlockhash",
+        "params": [{"commitment": "confirmed"}]
+    });
+    let resp = post_json(&client, solana_rpc_url, &body).await?;
+    let b58 = resp["result"]["value"]["blockhash"]
+        .as_str()
+        .ok_or_else(|| "getLatestBlockhash: no blockhash field".to_string())?;
+    let bytes = bs58::decode(b58).into_vec().map_err(|e| format!("bs58 decode: {e}"))?;
+    bytes.try_into().map_err(|_| "blockhash not 32 bytes".to_string())
 }
 
 // ── Solana RPC proxy ──────────────────────────────────────────────────────────
@@ -253,6 +366,19 @@ fn verify_execute_payment_instruction(message_bytes: &[u8], program_id: &[u8; 32
 
     let expected = crate::solana_tx::anchor_discriminator("execute_payment");
     message_bytes[cur..cur + 8] == expected
+}
+
+/// Extract the Nth 32-byte account key from a Solana legacy message body.
+/// `message_bytes` starts at the 3-byte header (not the tx-level sig array).
+fn extract_account_key(message_bytes: &[u8], index: usize) -> Option<[u8; 32]> {
+    if message_bytes.len() < 3 { return None; }
+    let (count, n) = read_compact_u16(&message_bytes[3..])?;
+    if index >= count as usize { return None; }
+    let key_start = 3 + n + index * 32;
+    if key_start + 32 > message_bytes.len() { return None; }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&message_bytes[key_start..key_start + 32]);
+    Some(key)
 }
 
 /// Parse a Solana compact_u16 from the start of `data`.

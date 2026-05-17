@@ -302,6 +302,120 @@ pub fn partial_sign_execute_payment(
     tx.to_base64()
 }
 
+// ── Plain tx (no durable nonce) ───────────────────────────────────────────────
+
+/// Accounts for the plain (non-durable-nonce) execute_payment flow.
+/// No `nonce_account` — `broadcaster` is filled by the beacon from its own keypair.
+pub struct PlainExecutePaymentAccounts {
+    pub payer: [u8; 32],
+    pub payer_ata: [u8; 32],
+    pub recipient: [u8; 32],
+    pub recipient_ata: [u8; 32],
+    pub broadcaster_ata: [u8; 32],
+    pub mint: [u8; 32],
+    pub program_id: [u8; 32],
+}
+
+/// Build an unsigned execute_payment transaction using a plain recent blockhash.
+///
+/// Single instruction only (no durable nonce advance). Both signature slots zeroed:
+///   slot 0 (payer): client fills via `sign_tx_at_slot`.
+///   slot 1 (broadcaster): beacon fills at cosign time.
+pub fn build_unsigned_execute_payment(
+    payer: &[u8; 32],
+    broadcaster: &[u8; 32],
+    recent_blockhash: [u8; 32],
+    accounts: &PlainExecutePaymentAccounts,
+    params: &ExecutePaymentParams,
+) -> Vec<u8> {
+    use pubkeys::*;
+
+    // 12 accounts (vs 14 with durable nonce):
+    //   Signers (writable):      payer [0], broadcaster [1]
+    //   Writable non-signers:    payer_ata [2], recipient [3], recipient_ata [4], broadcaster_ata [5]
+    //   Readonly non-signers:    mint [6], token_program [7], system_program [8],
+    //                            assoc_token_program [9], sysvar_rent [10], program_id [11]
+    let account_keys: Vec<[u8; 32]> = vec![
+        *payer, *broadcaster,
+        accounts.payer_ata, accounts.recipient, accounts.recipient_ata, accounts.broadcaster_ata,
+        accounts.mint, TOKEN_PROGRAM, SYSTEM_PROGRAM, ASSOCIATED_TOKEN_PROGRAM,
+        SYSVAR_RENT, accounts.program_id,
+    ];
+
+    let idx = |key: &[u8; 32]| -> u8 {
+        account_keys.iter().position(|k| k == key).expect("key in table") as u8
+    };
+
+    let ep_ix = CompiledInstruction {
+        program_id_index: idx(&accounts.program_id),
+        account_indices: vec![
+            idx(payer), idx(broadcaster),
+            idx(&accounts.payer_ata), idx(&accounts.recipient),
+            idx(&accounts.recipient_ata), idx(&accounts.broadcaster_ata),
+            idx(&accounts.mint), idx(&TOKEN_PROGRAM),
+            idx(&SYSTEM_PROGRAM), idx(&ASSOCIATED_TOKEN_PROGRAM), idx(&SYSVAR_RENT),
+        ],
+        data: build_execute_payment_ix_data(params).to_vec(),
+    };
+
+    let message = SolanaMessage {
+        header: MessageHeader {
+            num_required_signatures: 2,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 6, // mint, token_prog, sys_prog, atp, rent, program_id
+        },
+        account_keys,
+        recent_blockhash,
+        instructions: vec![ep_ix],
+    };
+
+    SolanaTransaction::new_unsigned(message).serialize()
+}
+
+// ── Tx-level utilities (operate on full serialized tx bytes) ──────────────────
+
+fn parse_tx_compact_u16(bytes: &[u8]) -> Option<(u16, usize)> {
+    let mut val: u16 = 0;
+    let mut shift = 0u16;
+    for (i, &b) in bytes.iter().enumerate().take(3) {
+        val |= ((b & 0x7f) as u16) << shift;
+        shift += 7;
+        if b & 0x80 == 0 { return Some((val, i + 1)); }
+    }
+    None
+}
+
+/// Sign a signature slot in a serialized Solana tx. Returns the modified tx bytes.
+/// Slot 0 = payer, slot 1 = broadcaster/cosigner.
+pub fn sign_tx_at_slot(tx_bytes: &[u8], keypair: &SigningKey, slot: usize) -> Vec<u8> {
+    let Some((n, cu16_len)) = parse_tx_compact_u16(tx_bytes) else {
+        return tx_bytes.to_vec();
+    };
+    let msg_start = cu16_len + (n as usize) * 64;
+    if msg_start > tx_bytes.len() { return tx_bytes.to_vec(); }
+    let sig: ed25519_dalek::Signature = keypair.sign(&tx_bytes[msg_start..]);
+    let mut out = tx_bytes.to_vec();
+    let off = cu16_len + slot * 64;
+    if off + 64 <= out.len() {
+        out[off..off + 64].copy_from_slice(&sig.to_bytes());
+    }
+    out
+}
+
+/// Verify that a signature slot contains a valid ed25519 signature over the tx message bytes.
+/// Beacon uses this to validate payer slot 0 before cosigning slot 1.
+pub fn verify_slot_signature(tx_bytes: &[u8], pubkey: &[u8; 32], slot: usize) -> bool {
+    use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+    let Some((n, cu16_len)) = parse_tx_compact_u16(tx_bytes) else { return false; };
+    if slot >= n as usize { return false; }
+    let sig_off = cu16_len + slot * 64;
+    let msg_start = cu16_len + (n as usize) * 64;
+    if sig_off + 64 > tx_bytes.len() || msg_start > tx_bytes.len() { return false; }
+    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else { return false };
+    let Ok(sig) = Signature::from_slice(&tx_bytes[sig_off..sig_off + 64]) else { return false };
+    vk.verify(&tx_bytes[msg_start..], &sig).is_ok()
+}
+
 // ── Nonce account parsing ─────────────────────────────────────────────────────
 
 /// Extract the nonce value (blockhash) from a `getAccountInfo` response.
@@ -351,5 +465,68 @@ mod tests {
     #[test]
     fn compact_u16_two_bytes_for_128() {
         assert_eq!(encode_compact_u16(128), vec![0x80, 0x01]);
+    }
+
+    fn test_plain_accounts() -> (PlainExecutePaymentAccounts, ExecutePaymentParams) {
+        let accounts = PlainExecutePaymentAccounts {
+            payer:          [1u8; 32],
+            payer_ata:      [3u8; 32],
+            recipient:      [4u8; 32],
+            recipient_ata:  [5u8; 32],
+            broadcaster_ata:[6u8; 32],
+            mint:           [7u8; 32],
+            program_id:     [8u8; 32],
+        };
+        let params = ExecutePaymentParams {
+            comp_offset: 0, amount: 1_000_000,
+            encrypted_amount: [0u8; 32], nonce: 42,
+            encryption_pub_key: [0u8; 32],
+        };
+        (accounts, params)
+    }
+
+    #[test]
+    fn plain_tx_has_12_accounts_and_2_zero_sig_slots() {
+        let (accounts, params) = test_plain_accounts();
+        let payer = [1u8; 32];
+        let broadcaster = [2u8; 32];
+        let tx = build_unsigned_execute_payment(&payer, &broadcaster, [0u8; 32], &accounts, &params);
+        // [0x02][64B zero sig0][64B zero sig1][message...]
+        assert_eq!(tx[0], 0x02);                      // compact_u16(2) — two sigs
+        assert_eq!(&tx[1..129], &[0u8; 128]);          // both sig slots zeros
+        assert_eq!(tx[129], 2);                        // num_required_signatures = 2
+        assert_eq!(tx[130], 0);                        // num_readonly_signed = 0
+        assert_eq!(tx[131], 6);                        // num_readonly_unsigned = 6
+        assert_eq!(tx[132], 12);                       // compact_u16(12) account count
+    }
+
+    #[test]
+    fn sign_tx_at_slot_fills_payer_and_verify_passes() {
+        let seed = [42u8; 32];
+        let keypair = SigningKey::from_bytes(&seed);
+        let payer = keypair.verifying_key().to_bytes();
+        let (mut accounts, params) = test_plain_accounts();
+        accounts.payer = payer;
+        let broadcaster = [2u8; 32];
+        let unsigned = build_unsigned_execute_payment(&payer, &broadcaster, [0u8; 32], &accounts, &params);
+        let signed = sign_tx_at_slot(&unsigned, &keypair, 0);
+        assert_ne!(&signed[1..65], &[0u8; 64]);        // slot 0 filled
+        assert_eq!(&signed[65..129], &[0u8; 64]);      // slot 1 still zero
+        assert!(verify_slot_signature(&signed, &payer, 0));
+        assert!(!verify_slot_signature(&signed, &broadcaster, 1)); // zeros = bad sig
+    }
+
+    #[test]
+    fn verify_slot_signature_rejects_wrong_pubkey() {
+        let seed = [42u8; 32];
+        let keypair = SigningKey::from_bytes(&seed);
+        let payer = keypair.verifying_key().to_bytes();
+        let (mut accounts, params) = test_plain_accounts();
+        accounts.payer = payer;
+        let broadcaster = [2u8; 32];
+        let unsigned = build_unsigned_execute_payment(&payer, &broadcaster, [0u8; 32], &accounts, &params);
+        let signed = sign_tx_at_slot(&unsigned, &keypair, 0);
+        let wrong_key = [99u8; 32];
+        assert!(!verify_slot_signature(&signed, &wrong_key, 0));
     }
 }

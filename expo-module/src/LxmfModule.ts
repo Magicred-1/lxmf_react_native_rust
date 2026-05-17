@@ -38,9 +38,11 @@ export type NativeModuleType = {
   // Beacon RPC — queue a JSON-RPC 2.0 call to a beacon; response arrives as onRpcResponse event.
   beaconRpc(destHashHex: string, method: string, paramsJson?: string | null): Promise<number>;
 
-  // Solana tx building — client-side partial sign
+  // Solana tx building — client-side partial sign (durable nonce flow)
   partialSignExecutePayment(payerKeyHex: string, nonceBlockhashHex: string, accountsJson: string, paramsJson: string): string | null;
   extractNonceBlockhash(accountDataB64: string): string | null;
+  // Sign payer slot 0 of an unsigned tx (plain blockhash flow / non-MWA path)
+  signTx(payerKeyHex: string, txB64: string): string | null;
 
   // Program ID — set once at init (deployment-specific: devnet vs mainnet)
   setProgramId(programIdHex: string): boolean;
@@ -102,6 +104,7 @@ const missingNativeShim: NativeModuleType = {
   beaconRpc: async () => throwMissingNative(),
   partialSignExecutePayment: () => throwMissingNative(),
   extractNonceBlockhash: () => throwMissingNative(),
+  signTx: () => throwMissingNative(),
   setProgramId: () => throwMissingNative(),
   getProgramId: () => throwMissingNative(),
   setBeaconKeypair: () => throwMissingNative(),

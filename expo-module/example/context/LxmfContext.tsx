@@ -111,12 +111,16 @@ export type LxmfContextValue = {
   beacons: Beacon[];
   beaconRpc: (destHashHex: string, method: string, params?: unknown) => Promise<number>;
   beaconRpcWait: (destHashHex: string, method: string, params?: unknown, timeoutMs?: number) => Promise<{ resultJson: string; isError: boolean }>;
-  beaconBroadcastRpc: (method: string, params?: unknown, timeoutMs?: number) => Promise<{ resultJson: string; isError: boolean; beaconHash: string }>;
-  cosignAndSubmit: (partialTxB64: string, timeoutMs?: number) => Promise<{ txSig: string; beaconHash: string }>;
+  beaconBroadcastRpc: (method: string, params?: unknown, timeoutMs?: number) => Promise<{ resultJson: string; beaconHash: string }>;
+  // 2-step cosign protocol (MWA-compatible)
+  requestUnsignedTx: (accounts: ExecutePaymentAccounts, params: ExecutePaymentParams, timeoutMs?: number) => Promise<{ unsignedTxB64: string; beaconHash: string }>;
+  submitSignedTx: (beaconHash: string, partialTxB64: string, timeoutMs?: number) => Promise<{ txSig: string; beaconHash: string }>;
+  cosignAndSubmit: (payerPrivKeyHex: string, accounts: ExecutePaymentAccounts, params: ExecutePaymentParams, timeoutMs?: number) => Promise<{ txSig: string; beaconHash: string }>;
   // Payment / program ID
   setProgramId: (programIdHex: string) => boolean;
   getProgramId: () => string | null;
-  partialSignExecutePayment: (payerKeyHex: string, nonceBlockhashHex: string, accounts: ExecutePaymentAccounts, params: ExecutePaymentParams) => string | null;
+  /** @deprecated Use cosignAndSubmit or requestUnsignedTx+submitSignedTx */
+  partialSignExecutePayment: (payerKeyHex: string, nonceBlockhashHex: string, accountsJson: string, paramsJson: string) => string | null;
   extractNonceBlockhash: (accountDataB64: string) => string | null;
   // Groups
   groups: Group[];
@@ -410,6 +414,8 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
     beaconRpc: lxmf.beaconRpc,
     beaconRpcWait: lxmf.beaconRpcWait,
     beaconBroadcastRpc: lxmf.beaconBroadcastRpc,
+    requestUnsignedTx: lxmf.requestUnsignedTx,
+    submitSignedTx: lxmf.submitSignedTx,
     cosignAndSubmit: lxmf.cosignAndSubmit,
     setProgramId: lxmf.setProgramId,
     getProgramId: lxmf.getProgramId,
@@ -426,7 +432,8 @@ export function LxmfProvider({ children }: { readonly children: React.ReactNode 
     lxmf.start, lxmf.stop, lxmf.getStatus, lxmf.setLogLevel,
     lxmf.setBeaconKeypair, lxmf.setBeaconSolanaRpc,
     lxmf.beacons, lxmf.beaconRpc, lxmf.beaconRpcWait, lxmf.beaconBroadcastRpc,
-    lxmf.cosignAndSubmit, lxmf.setProgramId, lxmf.getProgramId,
+    lxmf.requestUnsignedTx, lxmf.submitSignedTx, lxmf.cosignAndSubmit,
+    lxmf.setProgramId, lxmf.getProgramId,
     lxmf.partialSignExecutePayment, lxmf.extractNonceBlockhash,
     send, fetchMessages, identity, identityHydrated, clearIdentity,
     displayName, setDisplayName, contacts, upsertContact, markRead,

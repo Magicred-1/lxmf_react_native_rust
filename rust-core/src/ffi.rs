@@ -7,6 +7,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
 
+use base64::Engine as _;
 use zeroize::Zeroize;
 
 use log::{error, warn};
@@ -316,6 +317,40 @@ pub unsafe extern "C" fn lxmf_partial_sign_execute_payment(
 
     let tx_b64 = crate::solana_tx::partial_sign_execute_payment(&keypair, nonce_blockhash, &accounts, &params);
     let bytes = tx_b64.as_bytes();
+    if bytes.len() > out_cap { return -1; }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+    bytes.len() as i32
+}
+
+/// Sign payer slot 0 of a Solana tx already in serialized wire-format base64.
+///
+/// `payer_key` — 32-byte ed25519 seed (private key bytes). Zeroed immediately after use.
+/// `tx_b64`    — null-terminated base64-encoded serialized tx bytes.
+/// `out_buf`   — caller-provided output buffer for base64-encoded signed tx.
+/// Returns bytes written on success, -1 on any error.
+#[no_mangle]
+pub unsafe extern "C" fn lxmf_sign_tx(
+    payer_key: *const u8,
+    tx_b64: *const c_char,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    if payer_key.is_null() || tx_b64.is_null() || out_buf.is_null() { return -1; }
+
+    let seed_slice = std::slice::from_raw_parts(payer_key, 32);
+    let mut seed: [u8; 32] = match seed_slice.try_into() { Ok(s) => s, Err(_) => return -1 };
+    let keypair = ed25519_dalek::SigningKey::from_bytes(&seed);
+    seed.zeroize(); // zero raw seed immediately; SigningKey zeroes itself on drop
+
+    let b64_str = match CStr::from_ptr(tx_b64).to_str() { Ok(s) => s, Err(_) => return -1 };
+    let tx_bytes = match base64::engine::general_purpose::STANDARD.decode(b64_str) {
+        Ok(b) => b,
+        Err(_) => return -1,
+    };
+
+    let signed = crate::solana_tx::sign_tx_at_slot(&tx_bytes, &keypair, 0);
+    let result = base64::engine::general_purpose::STANDARD.encode(&signed);
+    let bytes = result.as_bytes();
     if bytes.len() > out_cap { return -1; }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
     bytes.len() as i32

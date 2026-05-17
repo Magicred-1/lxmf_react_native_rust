@@ -204,6 +204,14 @@ class LxmfModule : Module() {
       nativeExtractNonceBlockhash(accountDataB64)
     }
 
+    Function("signTx") { payerKeyHex: String, txB64: String ->
+      val payerKey = try { payerKeyHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray() }
+                     catch (e: Exception) { return@Function null }
+      val result = nativeSignTx(payerKey, txB64)
+      payerKey.fill(0)
+      result
+    }
+
     // --- Beacon configuration ---
 
     Function("setProgramId") { programIdHex: String ->
@@ -321,6 +329,7 @@ class LxmfModule : Module() {
   private external fun nativeAbiVersion(): Int
   private external fun nativePartialSignExecutePayment(payerKeyBytes: ByteArray, nonceBlockhash: ByteArray, accountsJson: String, paramsJson: String): String?
   private external fun nativeExtractNonceBlockhash(accountDataB64: String): String?
+  private external fun nativeSignTx(payerKeyBytes: ByteArray, txB64: String): String?
   private external fun nativeSetProgramId(programIdHex: String): Int
   private external fun nativeGetProgramId(): String?
   private external fun nativeSetBeaconKeypair(keyBytes: ByteArray): Int
